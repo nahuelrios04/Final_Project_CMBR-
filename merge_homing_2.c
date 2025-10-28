@@ -53,11 +53,11 @@ void homing_eje2(void);
 // (ELIMINADO: segunda definición de TAG)  // static const char *TAG = "BUSQUEDA_HOME_BIDIRECCIONAL";
 
 // ===================== Pines =====================
-#define PIN_STEP_2      20
-#define PIN_DIR_2       21
-#define PIN_EN_2        22
-#define PIN_HALL_2      23
-#define PIN_LED_D2      24
+#define PIN_STEP_2      21
+#define PIN_DIR_2       22
+#define PIN_EN_2        23
+#define PIN_HALL_2      25
+#define PIN_LED_D2      2
 
 // ===================== LEDC (Control del motor) =====================
 #define LEDC_MODO_H2         LEDC_HIGH_SPEED_MODE
