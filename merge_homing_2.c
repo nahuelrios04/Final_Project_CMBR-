@@ -5,344 +5,175 @@
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "esp_log.h"
-#include "esp_timer.h"      // <-- para esp_timer_get_time()
-#include "esp_rom_sys.h"    // <-- para esp_rom_delay_us()
+#include "esp_timer.h"      // esp_timer_get_time()
+#include "esp_rom_sys.h"    // esp_rom_delay_us()
 
-static const char *TAG = "TB6560_HOMING_2PASS";
+static const char *TAG = "HOMING_ALL_AXES";
 
-// ===== Pines =====
+/* ============================================================
+ *                      EJE 1 (TB6560 STYLE)
+ * ============================================================ */
+
+// --- Pines eje1 ---
 #define PIN_TB6560_STEP   18
 #define PIN_TB6560_DIR    17
 #define PIN_TB6560_EN     16
-#define PIN_HALL          26   // activo-bajo (usar pull-up)
+#define PIN_HALL_1        26   // activo-bajo (pull-up interna)
 
-// ===== Motor / Cinematica =====
-#define MOTOR_STEPS_PER_REV   200U
-#define MICROSTEP               8U
-#define HALF_TURN_STEPS   ((MOTOR_STEPS_PER_REV * MICROSTEP) / 2U)
+// --- Motor eje1 ---
+#define MOTOR_STEPS_PER_REV_1   200U
+#define MICROSTEP_1               8U
+#define HALF_TURN_STEPS_1   ((MOTOR_STEPS_PER_REV_1 * MICROSTEP_1) / 2U)
 
-// ===== Frecuencias (Hz) =====
-#define FREQ_MIN_HZ        400.0f   // arranque suave
-#define FREQ_PASS1_HZ      900.0f   // pasada 1 (CW, mas rapida)
-#define FREQ_PASS2_HZ      450.0f   // pasada 2 (CCW, mas lenta para afinar)
-#define FREQ_ALIGN_HZ      250.0f   // creep/alineacion muy lento
-#define FREQ_RELEASE_HZ    500.0f   // para soltar sensor si esta LOW
-#define FREQ_HALF_TURN     800.0f   // media vuelta de despegue
+// --- Frecuencias eje1 (Hz) ---
+#define FREQ_MIN_HZ_1        400.0f
+#define FREQ_PASS1_HZ_1      900.0f
+#define FREQ_PASS2_HZ_1      450.0f
+#define FREQ_ALIGN_HZ_1      250.0f
+#define FREQ_RELEASE_HZ_1    500.0f
+#define FREQ_HALF_TURN_1     800.0f
 
-// ===== Tiempos (ms) =====
-#define RAMP_MS           1200U     // rampa principal mas corta
-#define RAMP_DOWN_MS      1000U
-#define OVERTRAVEL_MS       15U     // micro avance tras detectar Hall (pasada 1)
-#define SEPARATE_MS         60U     // separacion minima si el Hall sigue activo antes de P2
-#define HALL_SAMPLE_MS       1U
-#define HALL_DEBOUNCE_N      3
+// --- Tiempos eje1 (ms) ---
+#define RAMP_MS_1            1200U
+#define OVERTRAVEL_MS_1        15U
+#define SEPARATE_MS_1          60U
+#define HALL_SAMPLE_MS_1        1U
+#define HALL_DEBOUNCE_N_1       3
 
-// ===== LEDC =====
-#define LEDC_TIMER_RES     LEDC_TIMER_10_BIT
-#define LEDC_MODE          LEDC_HIGH_SPEED_MODE
-#define LEDC_TIMER         LEDC_TIMER_0
-#define LEDC_CH            LEDC_CHANNEL_0
-#define LEDC_DUTY_ON       (1 << 6)   // ~50% (64/127)
-#define LEDC_DUTY_OFF      0
+// --- LEDC eje1 ---
+#define LEDC_MODE_1          LEDC_HIGH_SPEED_MODE
+#define LEDC_TIMER_1_ID      LEDC_TIMER_0       // Timer 0 para eje1
+#define LEDC_CH_1            LEDC_CHANNEL_0     // Canal 0 para eje1
+#define LEDC_RES_1           LEDC_TIMER_10_BIT
+#define LEDC_DUTY_ON_1       (1 << 6)           // ~50%
+#define LEDC_DUTY_OFF_1      0
 
-//////////////////////////////////////////////////////////////////////////////////////// aca se mexcla con el homing 2 
 
-void homing_eje1(void);
-void homing_eje2(void);
+/* ============================================================
+ *                      EJE 2
+ * ============================================================ */
 
-// (ELIMINADO: segunda definición de TAG)  // static const char *TAG = "BUSQUEDA_HOME_BIDIRECCIONAL";
-
-// ===================== Pines =====================
+// --- Pines eje2 ---
 #define PIN_STEP_2      21
 #define PIN_DIR_2       22
 #define PIN_EN_2        23
 #define PIN_HALL_2      25
-#define PIN_LED_D2      2
+#define PIN_LED_2        2   // LED indicador eje2
 
-// ===================== LEDC (Control del motor) =====================
-#define LEDC_MODO_H2         LEDC_HIGH_SPEED_MODE
-#define LEDC_TEMPORIZADOR_H2 LEDC_TIMER_0
-#define LEDC_CANAL_H2        LEDC_CHANNEL_0
-#define LEDC_RESOLUCION_H2   LEDC_TIMER_10_BIT
-#define LEDC_DUTY_ON_H2      (1 << 6)
-#define LEDC_DUTY_OFF_H2     0
+// --- Direcciones eje2 ---
+#define DERECHA_2    1
+#define IZQUIERDA_2  0
 
-// ===================== Parámetros de Movimiento =====================
-#define FREQ_BUSQUEDA_HZ_H2    1000.0f
-#define FREQ_VERIFICACION_HZ_2  400.0f     // <-- este reemplaza a FREQ_BUSQUEDA_HZ_2
-#define TIEMPO_RAMPA_MS_2       120U
-#define TIEMPO_SOBREPASO_MS_2  4000U       // <-- corrige TTIEMPO_SOBREPASO_MS_2
+// --- LEDC eje2 ---
+#define LEDC_MODE_2          LEDC_HIGH_SPEED_MODE
+#define LEDC_TIMER_2_ID      LEDC_TIMER_1       // Timer 1 para eje2
+#define LEDC_CH_2            LEDC_CHANNEL_1     // Canal 1 para eje2
+#define LEDC_RES_2           LEDC_TIMER_10_BIT
+#define LEDC_DUTY_ON_2       (1 << 6)
+#define LEDC_DUTY_OFF_2      0
 
-// ===================== Parámetros del sensor Hall =====================
-#define MUESTRA_HALL_MS_2     1
-#define NUMERO_MUESTRAS_N_2   2
+// --- Movimiento eje2 ---
+#define FREQ_BUSQUEDA_HZ_2        1000.0f
+#define FREQ_VERIFICACION_HZ_2     400.0f
+#define TIEMPO_RAMPA_MS_2           120U
+#define TIEMPO_SOBREPASO_MS_2      4000U
 
-// ===================== Direcciones del motor =====================
-#define DERECHA_2   1
-#define IZQUIERDA_2 0
+// --- Hall eje2 ---
+#define HALL_SAMPLE_MS_2           1U
+#define HALL_DEBOUNCE_N_2          2
 
-static inline int  leer_sensor_hall(void) {
-    return gpio_get_level(PIN_HALL_2) == 0;
-}
-static inline void habilitar_driver(bool encendido) {
-    gpio_set_level(PIN_EN_2, encendido ? 0 : 1);
-}
-static inline void fijar_direccion(int dir) {
-    gpio_set_level(PIN_DIR_2, dir);
-    esp_rom_delay_us(20);
-}
-static void inicializar_pwm(float frecuencia_inicial_hz) {
-    ledc_timer_config_t t = { .speed_mode = LEDC_MODO_H2, .duty_resolution = LEDC_RESOLUCION_H2, .timer_num = LEDC_TEMPORIZADOR_H2, .freq_hz = (uint32_t)frecuencia_inicial_hz, .clk_cfg = LEDC_AUTO_CLK };
-    ledc_timer_config(&t);
-    ledc_channel_config_t c = { .gpio_num = PIN_STEP_2, .speed_mode = LEDC_MODO_H2, .channel = LEDC_CANAL_H2, .timer_sel = LEDC_TEMPORIZADOR_H2, .duty = LEDC_DUTY_OFF_H2, .hpoint = 0 };
-    ledc_channel_config(&c);
-}
-static inline void arrancar_motor(void) {
-    ledc_set_duty(LEDC_MODO_H2, LEDC_CANAL_H2, LEDC_DUTY_ON_H2);
-    ledc_update_duty(LEDC_MODO_H2, LEDC_CANAL_H2);
-}
-static inline void parar_motor(void) {
-    ledc_stop(LEDC_MODO_H2, LEDC_CANAL_H2, LEDC_DUTY_OFF_H2);
-}
-static inline void fijar_frecuencia_pasos(float hz) {
-    if (hz < 1.0f) hz = 1.0f;
-    ledc_set_freq(LEDC_MODO_H2, LEDC_TEMPORIZADOR_H2, (uint32_t)hz);
-}
-static void esperar_hall_bajo_estable(void) {
-    int contador = 0;
-    while (true) {
-        if (leer_sensor_hall()) {
-            if (++contador >= NUMERO_MUESTRAS_N_2) return;
-        } else {
-            contador = 0;
-        }
-        vTaskDelay(pdMS_TO_TICKS(MUESTRA_HALL_MS_2));
-    }
-}
-static void esperar_hall_alto_estable(void) {
-    int contador = 0;
-    while (true) {
-        if (!leer_sensor_hall()) {
-            if (++contador >= NUMERO_MUESTRAS_N_2) return;
-        } else {
-            contador = 0;
-        }
-        vTaskDelay(pdMS_TO_TICKS(MUESTRA_HALL_MS_2));
-    }
-}
-static void rampa_de_velocidad(float frec_inicial, float frec_final, uint32_t duracion_ms) {
-    if (duracion_ms == 0 || fabsf(frec_final - frec_inicial) < 1.0f) { fijar_frecuencia_pasos(frec_final); return; }
-    uint32_t pasos = duracion_ms / 5U; if (!pasos) pasos = 1;
-    for (uint32_t i = 0; i <= pasos; i++) {
-        float t = (float)i / (float)pasos;
-        float s = 0.5f * (1.0f - cosf((float)M_PI * t));
-        fijar_frecuencia_pasos(frec_inicial + (frec_final - frec_inicial) * s);
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-}
 
-/* =====================================================================
- * FUNCIONES PRINCIPALES DE LÓGICA
- * ===================================================================== */
-typedef enum { RESULTADO_SOBREPASO_OK, RESULTADO_SOBREPASO_ENDSTOP } resultado_sobrepaso_t;
+/* ============================================================
+ *                      EJE 3
+ * ============================================================ */
 
-static resultado_sobrepaso_t realizar_verificacion_sobrepaso(void) {
-    fijar_frecuencia_pasos(FREQ_VERIFICACION_HZ_2);   // <-- antes FREQ_BUSQUEDA_HZ_2
-    arrancar_motor();
-    if (leer_sensor_hall()) {
-        esperar_hall_alto_estable();
-        ESP_LOGD(TAG, "Verificación: Se salió del imán inicial para empezar a contar.");
-    }
-    const int64_t tiempo_inicio_us = esp_timer_get_time();
-    int contador_bajo = 0;
-    while (true) {
-        uint32_t tiempo_transcurrido_ms = (uint32_t)((esp_timer_get_time() - tiempo_inicio_us) / 1000);
-        if (leer_sensor_hall()) {
-            if (++contador_bajo >= NUMERO_MUESTRAS_N_2) {
-                ESP_LOGW(TAG, "¡FINAL DE CARRERA DETECTADO! (Segundo imán encontrado).");
-                return RESULTADO_SOBREPASO_ENDSTOP;
-            }
-        } else {
-            contador_bajo = 0;
-        }
-        if (tiempo_transcurrido_ms >= TIEMPO_SOBREPASO_MS_2) {   // <-- corrige TTIEMPO_...
-            ESP_LOGI(TAG, "Verificación OK. No se encontró un segundo imán.");
-            return RESULTADO_SOBREPASO_OK;
-        }
-        vTaskDelay(pdMS_TO_TICKS(MUESTRA_HALL_MS_2));
-    }
+// --- Pines eje3 ---
+#define PIN_STEP_3      4
+#define PIN_DIR_3       5
+#define PIN_EN_3        15
+#define PIN_HALL_3      24
+#define PIN_LED_3       27   // LED indicador eje3
+
+// --- Direcciones eje3 ---
+#define DERECHA_3    1
+#define IZQUIERDA_3  0
+
+// --- LEDC eje3 ---
+#define LEDC_MODE_3          LEDC_HIGH_SPEED_MODE
+#define LEDC_TIMER_3_ID      LEDC_TIMER_2       // Timer 2 para eje3
+#define LEDC_CH_3            LEDC_CHANNEL_2     // Canal 2 para eje3
+#define LEDC_RES_3           LEDC_TIMER_10_BIT
+#define LEDC_DUTY_ON_3       (1 << 6)
+#define LEDC_DUTY_OFF_3      0
+
+// --- Movimiento eje3 ---
+#define FREQ_BUSQUEDA_HZ_3        1000.0f
+#define FREQ_VERIFICACION_HZ_3     400.0f
+#define TIEMPO_RAMPA_MS_3           120U
+#define TIEMPO_SOBREPASO_MS_3      4000U
+
+// --- Hall eje3 ---
+#define HALL_SAMPLE_MS_3           1U
+#define HALL_DEBOUNCE_N_3          2
+
+
+/* ============================================================
+ *               Protos eje1 / eje2 / eje3
+ * ============================================================ */
+static void homing_eje1(void);
+static void homing_eje2(void);
+static void homing_eje3(void);
+
+
+/* ============================================================
+ *                      UTILIDADES EJE1
+ * ============================================================ */
+
+// --- Low-level eje1 ---
+static inline void eje1_enable_driver(bool on)
+{
+    // EN activo-bajo: 0 = habilitado, 1 = deshabilitado
+    gpio_set_level(PIN_TB6560_EN, on ? 0 : 1);
+}
+static inline void eje1_set_dir(bool cw)
+{
+    gpio_set_level(PIN_TB6560_DIR, cw ? 1 : 0);
+}
+static inline int eje1_hall_raw(void)
+{
+    // sensor activo-bajo
+    return (gpio_get_level(PIN_HALL_1) == 0);
 }
 
-static void gestionar_final_de_carrera(int *p_dir) {
-    ESP_LOGW(TAG, "INICIANDO SECUENCIA DE ESCAPE DE ENDSTOP...");
-    gpio_set_level(PIN_LED_D2, 1);
-    *p_dir = (*p_dir == DERECHA_2) ? IZQUIERDA_2 : DERECHA_2;   // <-- IZQUIERDA_2
-    fijar_direccion(*p_dir);
-    fijar_frecuencia_pasos(FREQ_BUSQUEDA_HZ_H2);
-    arrancar_motor();
-    ESP_LOGI(TAG, "Paso 1/3: Alejándose del imán de disparo...");
-    esperar_hall_alto_estable();
-    ESP_LOGI(TAG, "Paso 2/3: Buscando el imán de límite para ignorarlo...");
-    esperar_hall_bajo_estable();
-    ESP_LOGW(TAG, "Imán de límite detectado. IGNORANDO y pasando de largo...");
-    ESP_LOGI(TAG, "Paso 3/3: Pasando de largo el imán de límite...");
-    esperar_hall_alto_estable();
-    ESP_LOGW(TAG, "SECUENCIA DE ESCAPE COMPLETA. Reanudando búsqueda normal de HOME.");
-    gpio_set_level(PIN_LED_D2, 0);
-}
-
-// ===================== NUEVA FUNCIÓN DE CHEQUEO BIDIRECCIONAL =====================
-static bool gestionar_arranque_sobre_iman(int *p_dir) {
-    ESP_LOGW(TAG, "Arranque sobre imán. Iniciando chequeo bidireccional...");
-
-    // --- CHEQUEO 1: HACIA LA DERECHA ---
-    ESP_LOGI(TAG, "Chequeo Bidireccional (1/2): Probando hacia la DERECHA...");
-    fijar_direccion(DERECHA_2);
-    if (realizar_verificacion_sobrepaso() == RESULTADO_SOBREPASO_ENDSTOP) {
-        ESP_LOGW(TAG, "ENDSTOP detectado a la derecha.");
-        *p_dir = DERECHA_2;
-        gestionar_final_de_carrera(p_dir);
-        return false;
-    }
-
-    // --- Volver al imán e ir a IZQUIERDA_2 ---
-    ESP_LOGI(TAG, "Chequeo a la DERECHA_2 OK. Volviendo al imán para probar hacia la IZQUIERDA...");
-    fijar_direccion(IZQUIERDA_2);     // <-- IZQUIERDA_2
-    arrancar_motor();
-    esperar_hall_bajo_estable(); // Volver al imán de partida
-
-    // --- CHEQUEO 2: HACIA LA IZQUIERDA ---
-    ESP_LOGI(TAG, "Chequeo Bidireccional (2/2): Probando hacia la IZQUIERDA...");
-    if (realizar_verificacion_sobrepaso() == RESULTADO_SOBREPASO_ENDSTOP) {
-        ESP_LOGW(TAG, "ENDSTOP detectado a la izquierda.");
-        *p_dir = IZQUIERDA_2;         // <-- IZQUIERDA_2
-        gestionar_final_de_carrera(p_dir);
-        return false;
-    }
-
-    // --- HOME confirmado ---
-    ESP_LOGI(TAG, "Chequeo bidireccional completo. Confirmado: arranque en HOME. Posicionando...");
-    fijar_direccion(DERECHA_2);
-    arrancar_motor();
-    esperar_hall_bajo_estable();
-
-    parar_motor();
-    habilitar_driver(false);
-    gpio_set_level(PIN_LED_D2, 1);
-    ESP_LOGI(TAG, "¡HOME confirmado y posicionado en arranque!");
-    return true;
-}
-
-static bool verificar_si_es_home_o_final_carrera(int *p_dir) {
-    rampa_de_velocidad(FREQ_BUSQUEDA_HZ_H2, FREQ_VERIFICACION_HZ_2, TIEMPO_RAMPA_MS_2);  // <-- FREQ_VERIFICACION_HZ_2
-    
-    if (realizar_verificacion_sobrepaso() == RESULTADO_SOBREPASO_ENDSTOP) {
-        gestionar_final_de_carrera(p_dir);
-        return false;
-    }
-
-    ESP_LOGI(TAG, "Acción: HOME encontrado. Volviendo para posicionamiento final.");
-    *p_dir = (*p_dir == DERECHA_2) ? IZQUIERDA_2 : DERECHA_2;  // <-- IZQUIERDA_2
-    fijar_direccion(*p_dir);
-    fijar_frecuencia_pasos(FREQ_VERIFICACION_HZ_2);           // <-- FREQ_VERIFICACION_HZ_2
-    arrancar_motor();
-    esperar_hall_bajo_estable();
-
-    parar_motor();
-    habilitar_driver(false);
-    gpio_set_level(PIN_LED_D2, 1);
-    ESP_LOGI(TAG, "¡HOME ENCONTRADO Y POSICIONADO! Secuencia finalizada.");
-    return true;
-}
-
-/* =====================================================================
- * TAREA PRINCIPAL Y app_main
- * ===================================================================== */
-void tarea_de_busqueda_home(void) {
-    int direccion_actual = DERECHA_2;
-    fijar_direccion(direccion_actual);
-
-    if (leer_sensor_hall()) {
-        if (gestionar_arranque_sobre_iman(&direccion_actual)) {
-            return;
-        }
-    } else {
-        ESP_LOGI(TAG, "Arranque normal. Iniciando búsqueda de HOME...");
-    }
-
-    ESP_LOGI(TAG, "Motor en marcha a %d Hz...", (int)FREQ_BUSQUEDA_HZ_H2);
-    fijar_frecuencia_pasos(FREQ_BUSQUEDA_HZ_H2);
-    arrancar_motor();
-
-    while (true) {
-        esperar_hall_bajo_estable();
-        ESP_LOGI(TAG, "Imán detectado. Iniciando análisis...");
-
-        if (verificar_si_es_home_o_final_carrera(&direccion_actual)) {
-            break;
-        }
-        ESP_LOGI(TAG, "Continuando búsqueda en la nueva dirección...");
-    }
-
-    ESP_LOGI(TAG, "Tarea de Homing finalizada.");
-}
-
-static void inicializar_gpios(void) {
-    gpio_config_t out_conf = {
-        .pin_bit_mask = (1ULL << PIN_DIR_2) | (1ULL << PIN_EN_2) | (1ULL << PIN_LED_D2),
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    gpio_config(&out_conf);
-
-    gpio_config_t in_conf = {
-        .pin_bit_mask = (1ULL << PIN_HALL_2),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-    };
-    gpio_config(&in_conf);
-
-    gpio_set_level(PIN_DIR_2, DERECHA_2);  // <-- corrige PIN_DIR -> PIN_DIR_2
-    gpio_set_level(PIN_EN_2, 1);           // <-- corrige PIN_EN  -> PIN_EN_2
-    gpio_set_level(PIN_LED_D2, 0);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// ---------- Utilidades GPIO/PWM ----------
-static inline void tb_enable(bool on){ gpio_set_level(PIN_TB6560_EN, on ? 0 : 1); } // activo-bajo
-static inline void tb_set_dir(bool cw){ gpio_set_level(PIN_TB6560_DIR, cw ? 1 : 0); }
-static inline int  hall_raw(void)     { return gpio_get_level(PIN_HALL) == 0; }     // 1 si LOW
-
-static int hall_is_active(void) {  // debounce a LOW
+// debounce hall LOW estable (detecta imán)
+static int eje1_wait_hall_active(void)
+{
     int cnt = 0;
-    for (;;) {
-        if (hall_raw()) cnt++; else cnt = 0;
-        if (cnt >= HALL_DEBOUNCE_N) return 1;
-        vTaskDelay(pdMS_TO_TICKS(HALL_SAMPLE_MS));
+    for(;;){
+        if (eje1_hall_raw()) cnt++; else cnt = 0;
+        if (cnt >= HALL_DEBOUNCE_N_1) return 1;
+        vTaskDelay(pdMS_TO_TICKS(HALL_SAMPLE_MS_1));
     }
 }
-static int hall_is_inactive(void) { // debounce a HIGH
+
+// debounce hall HIGH estable (liberado)
+static int eje1_wait_hall_inactive(void)
+{
     int cnt = 0;
-    for (;;) {
-        if (!hall_raw()) cnt++; else cnt = 0;
-        if (cnt >= HALL_DEBOUNCE_N) return 1;
-        vTaskDelay(pdMS_TO_TICKS(HALL_SAMPLE_MS));
+    for(;;){
+        if (!eje1_hall_raw()) cnt++; else cnt = 0;
+        if (cnt >= HALL_DEBOUNCE_N_1) return 1;
+        vTaskDelay(pdMS_TO_TICKS(HALL_SAMPLE_MS_1));
     }
 }
 
-static void pwm_start(void){
-    ledc_set_duty(LEDC_MODE, LEDC_CH, LEDC_DUTY_ON);
-    ledc_update_duty(LEDC_MODE, LEDC_CH);
-}
-static void pwm_stop(void){
-    ledc_stop(LEDC_MODE, LEDC_CH, LEDC_DUTY_OFF);
-}
-
-static void ledc_init(float start_hz){
+// PWM setup eje1
+static void eje1_pwm_init(float start_hz)
+{
     ledc_timer_config_t t = {
-        .speed_mode       = LEDC_MODE,
-        .duty_resolution  = LEDC_TIMER_RES,
-        .timer_num        = LEDC_TIMER,
+        .speed_mode       = LEDC_MODE_1,
+        .duty_resolution  = LEDC_RES_1,
+        .timer_num        = LEDC_TIMER_1_ID,
         .freq_hz          = (uint32_t)start_hz,
         .clk_cfg          = LEDC_AUTO_CLK
     };
@@ -350,203 +181,849 @@ static void ledc_init(float start_hz){
 
     ledc_channel_config_t c = {
         .gpio_num   = PIN_TB6560_STEP,
-        .speed_mode = LEDC_MODE,
-        .channel    = LEDC_CH,
-        .timer_sel  = LEDC_TIMER,
-        .duty       = LEDC_DUTY_ON,
+        .speed_mode = LEDC_MODE_1,
+        .channel    = LEDC_CH_1,
+        .timer_sel  = LEDC_TIMER_1_ID,
+        .duty       = LEDC_DUTY_ON_1,   // dejamos duty ya cargado
         .hpoint     = 0
     };
     ledc_channel_config(&c);
 }
 
-static inline void set_step_freq(float hz){
-    if (hz < FREQ_ALIGN_HZ) hz = FREQ_ALIGN_HZ; // mantener rango util
-    uint32_t set = ledc_set_freq(LEDC_MODE, LEDC_TIMER, (uint32_t)hz);
-    if (set == 0) ESP_LOGW(TAG, "No se pudo setear freq (%.1f Hz)", (double)hz);
+static inline void eje1_pwm_start(void)
+{
+    ledc_set_duty(LEDC_MODE_1, LEDC_CH_1, LEDC_DUTY_ON_1);
+    ledc_update_duty(LEDC_MODE_1, LEDC_CH_1);
+}
+static inline void eje1_pwm_stop(void)
+{
+    ledc_stop(LEDC_MODE_1, LEDC_CH_1, LEDC_DUTY_OFF_1);
 }
 
-// ---------- Rampa S-curve ----------
-static void ramp_to_freq(float f0, float f1, uint32_t ramp_ms){
-    const double PI = 3.14159265358979323846;
-    const TickType_t tick = pdMS_TO_TICKS(5);
-    uint32_t steps = (ramp_ms / 5U);
-    if (steps == 0) { set_step_freq(f1); return; }
+static inline void eje1_set_freq(float hz)
+{
+    if (hz < FREQ_ALIGN_HZ_1) hz = FREQ_ALIGN_HZ_1;
+    uint32_t ok = ledc_set_freq(LEDC_MODE_1, LEDC_TIMER_1_ID, (uint32_t)hz);
+    if (ok == 0) {
+        ESP_LOGW(TAG, "[EJE1] ledc_set_freq fallo (%.1f Hz)", (double)hz);
+    }
+}
 
-    pwm_start();
-    for (uint32_t i = 0; i <= steps; ++i) {
-        double t = (double)i / (double)steps;
-        double s = 0.5 * (1.0 - cos(PI * t));
-        double f = f0 + (f1 - f0) * s;
-        set_step_freq((float)f);
+// rampa S-curve eje1
+static void eje1_ramp_freq(float f0, float f1, uint32_t ramp_ms)
+{
+    const double PI = 3.14159265358979323846;
+    TickType_t tick = pdMS_TO_TICKS(5);
+
+    uint32_t steps = ramp_ms / 5U;
+    if (steps == 0){
+        eje1_set_freq(f1);
+        return;
+    }
+
+    eje1_pwm_start();
+    for(uint32_t i=0; i<=steps; i++){
+        double u = (double)i / (double)steps;
+        double s = 0.5*(1.0 - cos(PI*u));
+        double f = f0 + (f1 - f0)*s;
+        eje1_set_freq((float)f);
         vTaskDelay(tick);
     }
 }
 
-// ---------- Avanzar fijo en ms con la freq actual ----------
-static void advance_ms(uint32_t ms){
-    pwm_start();
-    vTaskDelay(pdMS_TO_TICKS(ms));
-}
-
-// ---------- Mover por CANTIDAD DE PASOS (aprox por tiempo) ----------
-static void move_steps_by_time(uint32_t steps, float freq_hz, bool cw){
-    tb_set_dir(cw);
-    set_step_freq(freq_hz);
-    pwm_start();
-    double seconds = (double)steps / (double)freq_hz;
-    uint32_t ms = (uint32_t)(seconds * 1000.0 + 0.5);
-    vTaskDelay(pdMS_TO_TICKS(ms));
-    pwm_stop();
-}
-
-// ---------- Pasada 1 (CW): detectar Hall por flanco, micro overtravel y STOP ----------
-static void pass1_seek_cw(void){
-    tb_set_dir(true); // CW
-    // Si arranco encima del hall, separo apenas en CCW y retomo CW
-    if (hall_raw()) {
-        tb_set_dir(false);
-        set_step_freq(FREQ_RELEASE_HZ);
-        pwm_start();
-        (void)hall_is_inactive();
-        vTaskDelay(pdMS_TO_TICKS(SEPARATE_MS));
-        pwm_stop();
-        tb_set_dir(true);
+// Paso 1: buscar imán en CW, sobrepasar un toque
+static void eje1_pass1_seek_cw(void)
+{
+    // Asegurar que no arrancamos ya encima del hall.
+    if (eje1_hall_raw()) {
+        // mover un toque en CCW (liberar)
+        eje1_set_dir(false); // CCW
+        eje1_set_freq(FREQ_RELEASE_HZ_1);
+        eje1_pwm_start();
+        eje1_wait_hall_inactive();
+        vTaskDelay(pdMS_TO_TICKS(SEPARATE_MS_1));
+        eje1_pwm_stop();
     }
 
-    ramp_to_freq(FREQ_MIN_HZ, FREQ_PASS1_HZ, RAMP_MS);
-    ESP_LOGI(TAG, "P1: Buscando Hall (%.0f Hz, CW)", (double)FREQ_PASS1_HZ);
+    // Buscar rápido en CW
+    eje1_set_dir(true); // CW
+    eje1_ramp_freq(FREQ_MIN_HZ_1, FREQ_PASS1_HZ_1, RAMP_MS_1);
+    ESP_LOGI(TAG, "[EJE1] P1: Buscando Hall en CW (%.0f Hz)", (double)FREQ_PASS1_HZ_1);
 
-    // Girar hasta detectar LOW (debounce)
-    pwm_start();
-    (void)hall_is_active();   // bloquea hasta LOW confirmado
+    eje1_pwm_start();
+    eje1_wait_hall_active(); // bloquea hasta LOW estable
+    eje1_pwm_stop();
 
-    // Freno inmediato
-    pwm_stop();
-    vTaskDelay(pdMS_TO_TICKS(10)); // mini pausa para inercia
+    // pequeño delay para inercia
+    vTaskDelay(pdMS_TO_TICKS(10));
 
-    // Micro avance (overtravel) para asegurar cruce completo del borde en CW
-    tb_set_dir(true);
-    set_step_freq(FREQ_ALIGN_HZ);
-    pwm_start();
-    vTaskDelay(pdMS_TO_TICKS(OVERTRAVEL_MS)); // 10–15 ms
-    pwm_stop();
+    // Overtravel pequeño para cruzar bien el borde
+    eje1_set_dir(true); // CW
+    eje1_set_freq(FREQ_ALIGN_HZ_1);
+    eje1_pwm_start();
+    vTaskDelay(pdMS_TO_TICKS(OVERTRAVEL_MS_1));
+    eje1_pwm_stop();
 
-    ESP_LOGI(TAG, "P1: Hall detectado y cruzado (CW).");
+    ESP_LOGI(TAG, "[EJE1] P1: Hall detectado y sobrepasado.");
 }
 
-// ---------- Pasada 2 (CCW): volver lento y quedar exactamente en el Hall ----------
-static void pass2_return_align_ccw(void){
-    // 1) Asegurar que no iniciamos P2 todavia sobre el sensor
-    if (hall_raw()) {
-        tb_set_dir(true); // CW para salir del Hall
-        set_step_freq(FREQ_RELEASE_HZ);
-        pwm_start();
+// Paso 2: volver lento CCW y parar justo arriba del imán
+static void eje1_pass2_return_align_ccw(void)
+{
+    // Si sigo arriba del hall al iniciar P2, salgo un toque en CW
+    if (eje1_hall_raw()) {
+        eje1_set_dir(true); // CW para liberar
+        eje1_set_freq(FREQ_RELEASE_HZ_1);
+        eje1_pwm_start();
 
         uint32_t t0 = (uint32_t)esp_log_timestamp();
-        while (hall_raw() && (esp_log_timestamp() - t0) < 3000) { // max 3 s
+        while (eje1_hall_raw() &&
+               (esp_log_timestamp() - t0) < 3000) {
             vTaskDelay(pdMS_TO_TICKS(5));
         }
 
-        pwm_stop();
-        vTaskDelay(pdMS_TO_TICKS(SEPARATE_MS)); // separacion minima
-        ESP_LOGI(TAG, "P2: Hall liberado, listo para volver CCW");
+        eje1_pwm_stop();
+        vTaskDelay(pdMS_TO_TICKS(SEPARATE_MS_1));
+
+        ESP_LOGI(TAG, "[EJE1] P2: Hall liberado, listo para volver CCW.");
     }
 
-    // 2) Volver CCW lentamente hasta detectar el Hall nuevamente
-    tb_set_dir(false); // CCW
-    ramp_to_freq(FREQ_MIN_HZ, FREQ_PASS2_HZ, 800U); // rampa mas corta en P2
-    ESP_LOGI(TAG, "P2: Regresando hacia Hall (%.0f Hz, CCW, mas lento)", (double)FREQ_PASS2_HZ);
+    // Ahora volver CCW más lento hasta re-enganchar el hall
+    eje1_set_dir(false); // CCW
+    eje1_ramp_freq(FREQ_MIN_HZ_1, FREQ_PASS2_HZ_1, 800U);
+    ESP_LOGI(TAG, "[EJE1] P2: Regresando lento CCW (%.0f Hz)", (double)FREQ_PASS2_HZ_1);
 
-    pwm_start();
+    eje1_pwm_start();
     uint32_t t1 = (uint32_t)esp_log_timestamp();
-    while (!hall_raw() && (esp_log_timestamp() - t1) < 4000) { // max 4 s
+    while (!eje1_hall_raw() &&
+           (esp_log_timestamp() - t1) < 4000) {
         vTaskDelay(pdMS_TO_TICKS(2));
     }
-    pwm_stop();
+    eje1_pwm_stop();
 
-    if (!hall_raw()) {
-        ESP_LOGW(TAG, "P2: No se detecto Hall dentro del tiempo. Quizas ya estaba encima.");
-        return;
+    if (!eje1_hall_raw()) {
+        ESP_LOGW(TAG, "[EJE1] P2: No se detecto Hall a tiempo. Puede que ya esté encima.");
+        // seguimos igual
     }
 
-    // 3) Alineacion fina: microajuste CCW a velocidad muy baja
-    tb_set_dir(false); // CCW
-    set_step_freq(FREQ_ALIGN_HZ);
-    pwm_start();
-    if (!hall_raw()) (void)hall_is_active();
-    vTaskDelay(pdMS_TO_TICKS(20)); // pequeno avance controlado para sentar en el borde
-    pwm_stop();
+    // Alineación fina CCW MUY lento
+    eje1_set_dir(false); // CCW
+    eje1_set_freq(FREQ_ALIGN_HZ_1);
+    eje1_pwm_start();
 
-    ESP_LOGI(TAG, "P2: Alineado exactamente sobre Hall (CCW).");
+    if (!eje1_hall_raw()) {
+        eje1_wait_hall_active();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+    eje1_pwm_stop();
+
+    ESP_LOGI(TAG, "[EJE1] P2: Alineado sobre HOME (hall).");
 }
 
-// ---------- GPIO ----------
-static void io_init(void){
-    gpio_config_t io = {
-        .pin_bit_mask = (1ULL<<PIN_TB6560_DIR) | (1ULL<<PIN_TB6560_EN),
+// GPIO init eje1
+static void eje1_gpio_init(void)
+{
+    // STEP, DIR, EN -> salida
+    gpio_config_t out_conf = {
+        .pin_bit_mask = (1ULL << PIN_TB6560_STEP) |
+                        (1ULL << PIN_TB6560_DIR ) |
+                        (1ULL << PIN_TB6560_EN  ),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE
     };
-    gpio_config(&io);
+    gpio_config(&out_conf);
 
-    gpio_config_t hall = {
-        .pin_bit_mask = (1ULL<<PIN_HALL),
+    // Hall -> entrada pull-up
+    gpio_config_t in_conf = {
+        .pin_bit_mask = (1ULL << PIN_HALL_1),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,     // Hall activo-bajo
+        .pull_up_en = GPIO_PULLUP_ENABLE,     // sensor activo-bajo
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE
     };
-    gpio_config(&hall);
+    gpio_config(&in_conf);
+
+    // Estado inicial
+    gpio_set_level(PIN_TB6560_EN, 1); // deshabilitado (activo-bajo)
+    gpio_set_level(PIN_TB6560_DIR, 1);
 }
 
-void homing_eje1(void){
-    ESP_LOGI(TAG, "Inicio homing (2 pasadas: CW y CCW)");
-    io_init();
-    ledc_init(FREQ_MIN_HZ);
-    tb_enable(true);
+/* HOMING EJE1 */
+static void homing_eje1(void)
+{
+    ESP_LOGI(TAG, "[EJE1] Inicio homing 2-pass CW/CCW");
+    eje1_gpio_init();
+    eje1_pwm_init(FREQ_MIN_HZ_1);
+    eje1_enable_driver(true);
 
-    // Arranque inteligente: si el Hall esta en LOW, media vuelta para despegar
-    if (hall_raw()) {
-        ESP_LOGI(TAG, "Hall LOW al iniciar -> media vuelta CW");
-        double seconds = (double)HALF_TURN_STEPS / (double)FREQ_HALF_TURN;
+    // Si arranca encima del hall -> media vuelta rápida CW para despegar
+    if (eje1_hall_raw()) {
+        ESP_LOGI(TAG, "[EJE1] Hall activo al inicio -> media vuelta CW para despegar");
+        double seconds = (double)HALF_TURN_STEPS_1 / (double)FREQ_HALF_TURN_1;
         uint32_t ms = (uint32_t)(seconds * 1000.0 + 0.5);
-        tb_set_dir(!true);
-        set_step_freq(FREQ_HALF_TURN);
-        pwm_start();
+
+        eje1_set_dir(true); // CW
+        eje1_set_freq(FREQ_HALF_TURN_1);
+        eje1_pwm_start();
         vTaskDelay(pdMS_TO_TICKS(ms));
-        pwm_stop();
+        eje1_pwm_stop();
         vTaskDelay(pdMS_TO_TICKS(60));
     }
 
-    // 1) Pasada CW (detecta, micro overtravel y se detiene)
-    pass1_seek_cw();
+    // Pasada 1 CW + sobrepaso
+    eje1_pass1_seek_cw();
 
-    // 2) Pasada CCW (mas lenta) y queda exactamente sobre el Hall
-    pass2_return_align_ccw();
+    // Pasada 2 CCW y ajuste fino
+    eje1_pass2_return_align_ccw();
 
-    tb_enable(false);
-    pwm_stop();
-    ESP_LOGI(TAG, "Homing COMPLETO: 2 pasadas y posicionado en Hall.");
+    eje1_enable_driver(false);
+    eje1_pwm_stop();
+    ESP_LOGI(TAG, "[EJE1] Homing COMPLETO y posicionado en HOME.");
 }
 
-void homing_eje2(void){
-    ESP_LOGI(TAG, "Inicializando sistema de Homing (con chequeo bidireccional)...");
-    inicializar_gpios();
-    inicializar_pwm(FREQ_BUSQUEDA_HZ_H2);
 
-    habilitar_driver(true);
+/* ============================================================
+ *                      UTILIDADES GENERICAS PARA EJE2 / EJE3
+ *    Vamos a clonar la misma lógica para ambos, cambiando sufijos
+ * ============================================================ */
+
+/* ---------- EJE2 LOW LEVEL ---------- */
+
+static inline int eje2_hall_read(void)
+{
+    return (gpio_get_level(PIN_HALL_2) == 0); // activo-bajo
+}
+
+static void eje2_wait_hall_low_estable(void)
+{
+    int cnt = 0;
+    for(;;){
+        if (eje2_hall_read()) {
+            if (++cnt >= HALL_DEBOUNCE_N_2) return;
+        } else {
+            cnt = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(HALL_SAMPLE_MS_2));
+    }
+}
+static void eje2_wait_hall_high_estable(void)
+{
+    int cnt = 0;
+    for(;;){
+        if (!eje2_hall_read()) {
+            if (++cnt >= HALL_DEBOUNCE_N_2) return;
+        } else {
+            cnt = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(HALL_SAMPLE_MS_2));
+    }
+}
+
+static inline void eje2_enable_driver(bool on)
+{
+    // activo-bajo
+    gpio_set_level(PIN_EN_2, on ? 0 : 1);
+}
+static inline void eje2_set_dir(int dir)
+{
+    gpio_set_level(PIN_DIR_2, dir);
+    esp_rom_delay_us(20);
+}
+static void eje2_pwm_init(float start_hz)
+{
+    ledc_timer_config_t t = {
+        .speed_mode      = LEDC_MODE_2,
+        .duty_resolution = LEDC_RES_2,
+        .timer_num       = LEDC_TIMER_2_ID,
+        .freq_hz         = (uint32_t)start_hz,
+        .clk_cfg         = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&t);
+
+    ledc_channel_config_t c = {
+        .gpio_num   = PIN_STEP_2,
+        .speed_mode = LEDC_MODE_2,
+        .channel    = LEDC_CH_2,
+        .timer_sel  = LEDC_TIMER_2_ID,
+        .duty       = LEDC_DUTY_OFF_2,
+        .hpoint     = 0
+    };
+    ledc_channel_config(&c);
+}
+static inline void eje2_pwm_start(void)
+{
+    ledc_set_duty(LEDC_MODE_2, LEDC_CH_2, LEDC_DUTY_ON_2);
+    ledc_update_duty(LEDC_MODE_2, LEDC_CH_2);
+}
+static inline void eje2_pwm_stop(void)
+{
+    ledc_stop(LEDC_MODE_2, LEDC_CH_2, LEDC_DUTY_OFF_2);
+}
+static inline void eje2_set_freq(float hz)
+{
+    if (hz < 1.0f) hz = 1.0f;
+    ledc_set_freq(LEDC_MODE_2, LEDC_TIMER_2_ID, (uint32_t)hz);
+}
+static void eje2_ramp_freq(float fi, float ff, uint32_t dur_ms)
+{
+    if (dur_ms == 0 || fabsf(ff - fi) < 1.0f) {
+        eje2_set_freq(ff);
+        return;
+    }
+    uint32_t steps = dur_ms / 5U;
+    if (!steps) steps = 1;
+    for(uint32_t i=0; i<=steps; i++){
+        float u = (float)i / (float)steps;
+        float s = 0.5f * (1.0f - cosf((float)M_PI * u));
+        eje2_set_freq(fi + (ff - fi) * s);
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+/* ---------- EJE3 LOW LEVEL ---------- */
+
+static inline int eje3_hall_read(void)
+{
+    return (gpio_get_level(PIN_HALL_3) == 0); // activo-bajo
+}
+static void eje3_wait_hall_low_estable(void)
+{
+    int cnt = 0;
+    for(;;){
+        if (eje3_hall_read()) {
+            if (++cnt >= HALL_DEBOUNCE_N_3) return;
+        } else {
+            cnt = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(HALL_SAMPLE_MS_3));
+    }
+}
+static void eje3_wait_hall_high_estable(void)
+{
+    int cnt = 0;
+    for(;;){
+        if (!eje3_hall_read()) {
+            if (++cnt >= HALL_DEBOUNCE_N_3) return;
+        } else {
+            cnt = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(HALL_SAMPLE_MS_3));
+    }
+}
+
+static inline void eje3_enable_driver(bool on)
+{
+    gpio_set_level(PIN_EN_3, on ? 0 : 1); // activo-bajo
+}
+static inline void eje3_set_dir(int dir)
+{
+    gpio_set_level(PIN_DIR_3, dir);
+    esp_rom_delay_us(20);
+}
+static void eje3_pwm_init(float start_hz)
+{
+    ledc_timer_config_t t = {
+        .speed_mode      = LEDC_MODE_3,
+        .duty_resolution = LEDC_RES_3,
+        .timer_num       = LEDC_TIMER_3_ID,
+        .freq_hz         = (uint32_t)start_hz,
+        .clk_cfg         = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&t);
+
+    ledc_channel_config_t c = {
+        .gpio_num   = PIN_STEP_3,
+        .speed_mode = LEDC_MODE_3,
+        .channel    = LEDC_CH_3,
+        .timer_sel  = LEDC_TIMER_3_ID,
+        .duty       = LEDC_DUTY_OFF_3,
+        .hpoint     = 0
+    };
+    ledc_channel_config(&c);
+}
+static inline void eje3_pwm_start(void)
+{
+    ledc_set_duty(LEDC_MODE_3, LEDC_CH_3, LEDC_DUTY_ON_3);
+    ledc_update_duty(LEDC_MODE_3, LEDC_CH_3);
+}
+static inline void eje3_pwm_stop(void)
+{
+    ledc_stop(LEDC_MODE_3, LEDC_CH_3, LEDC_DUTY_OFF_3);
+}
+static inline void eje3_set_freq(float hz)
+{
+    if (hz < 1.0f) hz = 1.0f;
+    ledc_set_freq(LEDC_MODE_3, LEDC_TIMER_3_ID, (uint32_t)hz);
+}
+static void eje3_ramp_freq(float fi, float ff, uint32_t dur_ms)
+{
+    if (dur_ms == 0 || fabsf(ff - fi) < 1.0f) {
+        eje3_set_freq(ff);
+        return;
+    }
+    uint32_t steps = dur_ms / 5U;
+    if (!steps) steps = 1;
+    for(uint32_t i=0; i<=steps; i++){
+        float u = (float)i / (float)steps;
+        float s = 0.5f * (1.0f - cosf((float)M_PI * u));
+        eje3_set_freq(fi + (ff - fi) * s);
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+
+/* ============================================================
+ *          LÓGICA DE HOMING EJE2 (HOME vs ENDSTOP)
+ *          y la misma para EJE3
+ * ============================================================ */
+
+typedef enum {
+    SOBREPASO_OK = 0,
+    SOBREPASO_ENDSTOP = 1
+} sobrepaso_result_t;
+
+/* ---------- EJE2: chequeo sobrepaso ---------- */
+static sobrepaso_result_t eje2_verificar_sobrepaso(void)
+{
+    eje2_set_freq(FREQ_VERIFICACION_HZ_2);
+    eje2_pwm_start();
+
+    // si estaba sobre el imán al inicio, salir primero
+    if (eje2_hall_read()) {
+        eje2_wait_hall_high_estable();
+        ESP_LOGD(TAG, "[EJE2] Salimos del imán inicial antes de contar tiempo.");
+    }
+
+    const int64_t t0 = esp_timer_get_time();
+    int cnt_low = 0;
+
+    while (1) {
+        uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() - t0)/1000);
+
+        if (eje2_hall_read()) {
+            if (++cnt_low >= HALL_DEBOUNCE_N_2) {
+                ESP_LOGW(TAG, "[EJE2] ENDSTOP detectado (segundo imán).");
+                eje2_pwm_stop();
+                return SOBREPASO_ENDSTOP;
+            }
+        } else {
+            cnt_low = 0;
+        }
+
+        if (elapsed_ms >= TIEMPO_SOBREPASO_MS_2) {
+            ESP_LOGI(TAG, "[EJE2] Sin segundo imán -> OK (HOME probable).");
+            eje2_pwm_stop();
+            return SOBREPASO_OK;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(HALL_SAMPLE_MS_2));
+    }
+}
+
+/* ---------- EJE3: chequeo sobrepaso ---------- */
+static sobrepaso_result_t eje3_verificar_sobrepaso(void)
+{
+    eje3_set_freq(FREQ_VERIFICACION_HZ_3);
+    eje3_pwm_start();
+
+    if (eje3_hall_read()) {
+        eje3_wait_hall_high_estable();
+        ESP_LOGD(TAG, "[EJE3] Salimos del imán inicial antes de contar tiempo.");
+    }
+
+    const int64_t t0 = esp_timer_get_time();
+    int cnt_low = 0;
+
+    while (1) {
+        uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() - t0)/1000);
+
+        if (eje3_hall_read()) {
+            if (++cnt_low >= HALL_DEBOUNCE_N_3) {
+                ESP_LOGW(TAG, "[EJE3] ENDSTOP detectado (segundo imán).");
+                eje3_pwm_stop();
+                return SOBREPASO_ENDSTOP;
+            }
+        } else {
+            cnt_low = 0;
+        }
+
+        if (elapsed_ms >= TIEMPO_SOBREPASO_MS_3) {
+            ESP_LOGI(TAG, "[EJE3] Sin segundo imán -> OK (HOME probable).");
+            eje3_pwm_stop();
+            return SOBREPASO_OK;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(HALL_SAMPLE_MS_3));
+    }
+}
+
+
+/* ---------- EJE2: rutina escape endstop ---------- */
+static void eje2_escape_endstop(int *p_dir_actual)
+{
+    ESP_LOGW(TAG, "[EJE2] ESCAPE ENDSTOP...");
+    gpio_set_level(PIN_LED_2, 1);
+
+    // invertimos dirección
+    *p_dir_actual = (*p_dir_actual == DERECHA_2) ? IZQUIERDA_2 : DERECHA_2;
+    eje2_set_dir(*p_dir_actual);
+
+    eje2_set_freq(FREQ_BUSQUEDA_HZ_2);
+    eje2_pwm_start();
+
+    // 1) Alejarse del primer imán
+    eje2_wait_hall_high_estable();
+
+    // 2) Detectar siguiente imán (límite duro)
+    eje2_wait_hall_low_estable();
+    ESP_LOGW(TAG, "[EJE2] Límite detectado, ignorando y pasando de largo...");
+
+    // 3) Pasar de largo ese imán límite
+    eje2_wait_hall_high_estable();
+
+    eje2_pwm_stop();
+    gpio_set_level(PIN_LED_2, 0);
+    ESP_LOGW(TAG, "[EJE2] ESCAPE READY. Continuar búsqueda normal.");
+}
+
+/* ---------- EJE3: rutina escape endstop ---------- */
+static void eje3_escape_endstop(int *p_dir_actual)
+{
+    ESP_LOGW(TAG, "[EJE3] ESCAPE ENDSTOP...");
+    gpio_set_level(PIN_LED_3, 1);
+
+    *p_dir_actual = (*p_dir_actual == DERECHA_3) ? IZQUIERDA_3 : DERECHA_3;
+    eje3_set_dir(*p_dir_actual);
+
+    eje3_set_freq(FREQ_BUSQUEDA_HZ_3);
+    eje3_pwm_start();
+
+    eje3_wait_hall_high_estable(); // alejarse
+    eje3_wait_hall_low_estable();  // detectar límite
+    ESP_LOGW(TAG, "[EJE3] Límite detectado, ignorar y pasar de largo...");
+    eje3_wait_hall_high_estable(); // salir del límite
+
+    eje3_pwm_stop();
+    gpio_set_level(PIN_LED_3, 0);
+    ESP_LOGW(TAG, "[EJE3] ESCAPE READY. Continuar búsqueda normal.");
+}
+
+
+/* ---------- EJE2: arranque si ya estás sobre el imán ---------- */
+static bool eje2_arranque_sobre_iman(int *p_dir_actual)
+{
+    ESP_LOGW(TAG, "[EJE2] Arrancamos SOBRE imán. Chequeo bidireccional...");
+
+    // 1) Probar DERECHA
+    ESP_LOGI(TAG, "[EJE2] Test DERECHA");
+    *p_dir_actual = DERECHA_2;
+    eje2_set_dir(DERECHA_2);
+
+    if (eje2_verificar_sobrepaso() == SOBREPASO_ENDSTOP) {
+        ESP_LOGW(TAG, "[EJE2] ENDSTOP a la derecha");
+        eje2_escape_endstop(p_dir_actual);
+        return false; // no homing todavía
+    }
+
+    // 2) Volver al imán y probar IZQUIERDA
+    ESP_LOGI(TAG, "[EJE2] Derecha OK. Volviendo al imán y probando IZQUIERDA...");
+    eje2_set_dir(IZQUIERDA_2);
+    eje2_pwm_start();
+    eje2_wait_hall_low_estable(); // volver al mismo imán
+    eje2_pwm_stop();
+
+    *p_dir_actual = IZQUIERDA_2;
+    eje2_set_dir(IZQUIERDA_2);
+
+    if (eje2_verificar_sobrepaso() == SOBREPASO_ENDSTOP) {
+        ESP_LOGW(TAG, "[EJE2] ENDSTOP a la izquierda");
+        eje2_escape_endstop(p_dir_actual);
+        return false;
+    }
+
+    // Si llegamos acá, ninguna dirección fue endstop => estamos en HOME real.
+    ESP_LOGI(TAG, "[EJE2] HOME confirmado (en arranque). Posicionando en el borde...");
+    eje2_set_dir(DERECHA_2);
+    eje2_pwm_start();
+    eje2_wait_hall_low_estable();
+    eje2_pwm_stop();
+
+    eje2_enable_driver(false);
+    gpio_set_level(PIN_LED_2, 1);
+    ESP_LOGI(TAG, "[EJE2] HOME posicionado.");
+    return true;
+}
+
+/* ---------- EJE3: arranque si ya estás sobre el imán ---------- */
+static bool eje3_arranque_sobre_iman(int *p_dir_actual)
+{
+    ESP_LOGW(TAG, "[EJE3] Arrancamos SOBRE imán. Chequeo bidireccional...");
+
+    // 1) Probar DERECHA
+    ESP_LOGI(TAG, "[EJE3] Test DERECHA");
+    *p_dir_actual = DERECHA_3;
+    eje3_set_dir(DERECHA_3);
+
+    if (eje3_verificar_sobrepaso() == SOBREPASO_ENDSTOP) {
+        ESP_LOGW(TAG, "[EJE3] ENDSTOP a la derecha");
+        eje3_escape_endstop(p_dir_actual);
+        return false;
+    }
+
+    // 2) Volver al imán y probar IZQUIERDA
+    ESP_LOGI(TAG, "[EJE3] Derecha OK. Volviendo al imán y probando IZQUIERDA...");
+    eje3_set_dir(IZQUIERDA_3);
+    eje3_pwm_start();
+    eje3_wait_hall_low_estable(); // volver al mismo imán
+    eje3_pwm_stop();
+
+    *p_dir_actual = IZQUIERDA_3;
+    eje3_set_dir(IZQUIERDA_3);
+
+    if (eje3_verificar_sobrepaso() == SOBREPASO_ENDSTOP) {
+        ESP_LOGW(TAG, "[EJE3] ENDSTOP a la izquierda");
+        eje3_escape_endstop(p_dir_actual);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "[EJE3] HOME confirmado (en arranque). Posicionando en el borde...");
+    eje3_set_dir(DERECHA_3);
+    eje3_pwm_start();
+    eje3_wait_hall_low_estable();
+    eje3_pwm_stop();
+
+    eje3_enable_driver(false);
+    gpio_set_level(PIN_LED_3, 1);
+    ESP_LOGI(TAG, "[EJE3] HOME posicionado.");
+    return true;
+}
+
+
+/* ---------- EJE2: decide si es HOME o ENDSTOP cuando detecta un imán en carrera ---------- */
+static bool eje2_confirmar_home_o_endstop(int *p_dir_actual)
+{
+    // rampa de búsqueda -> verificación más lenta
+    eje2_ramp_freq(FREQ_BUSQUEDA_HZ_2, FREQ_VERIFICACION_HZ_2, TIEMPO_RAMPA_MS_2);
+
+    if (eje2_verificar_sobrepaso() == SOBREPASO_ENDSTOP) {
+        eje2_escape_endstop(p_dir_actual);
+        return false; // seguir buscando
+    }
+
+    // Es HOME, ahora retroceso corto para quedar justo en el imán
+    ESP_LOGI(TAG, "[EJE2] HOME detectado. Ajustando posición fina...");
+    *p_dir_actual = (*p_dir_actual == DERECHA_2) ? IZQUIERDA_2 : DERECHA_2;
+    eje2_set_dir(*p_dir_actual);
+
+    eje2_set_freq(FREQ_VERIFICACION_HZ_2);
+    eje2_pwm_start();
+    eje2_wait_hall_low_estable();
+    eje2_pwm_stop();
+
+    eje2_enable_driver(false);
+    gpio_set_level(PIN_LED_2, 1);
+    ESP_LOGI(TAG, "[EJE2] HOME POSICIONADO FINAL.");
+    return true;
+}
+
+/* ---------- EJE3: igual que eje2 pero con sufijo 3 ---------- */
+static bool eje3_confirmar_home_o_endstop(int *p_dir_actual)
+{
+    eje3_ramp_freq(FREQ_BUSQUEDA_HZ_3, FREQ_VERIFICACION_HZ_3, TIEMPO_RAMPA_MS_3);
+
+    if (eje3_verificar_sobrepaso() == SOBREPASO_ENDSTOP) {
+        eje3_escape_endstop(p_dir_actual);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "[EJE3] HOME detectado. Ajustando posición fina...");
+    *p_dir_actual = (*p_dir_actual == DERECHA_3) ? IZQUIERDA_3 : DERECHA_3;
+    eje3_set_dir(*p_dir_actual);
+
+    eje3_set_freq(FREQ_VERIFICACION_HZ_3);
+    eje3_pwm_start();
+    eje3_wait_hall_low_estable();
+    eje3_pwm_stop();
+
+    eje3_enable_driver(false);
+    gpio_set_level(PIN_LED_3, 1);
+    ESP_LOGI(TAG, "[EJE3] HOME POSICIONADO FINAL.");
+    return true;
+}
+
+
+/* ============================================================
+ *                      GPIO INIT eje2 / eje3
+ * ============================================================ */
+
+static void eje2_gpio_init(void)
+{
+    // DIR, EN, STEP, LED -> salida
+    gpio_config_t out_conf = {
+        .pin_bit_mask =
+            (1ULL << PIN_DIR_2 ) |
+            (1ULL << PIN_EN_2  ) |
+            (1ULL << PIN_STEP_2) |
+            (1ULL << PIN_LED_2 ),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&out_conf);
+
+    // HALL -> entrada pull-up
+    gpio_config_t in_conf = {
+        .pin_bit_mask = (1ULL << PIN_HALL_2),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&in_conf);
+
+    // estados iniciales
+    gpio_set_level(PIN_DIR_2, DERECHA_2);
+    gpio_set_level(PIN_EN_2, 1);      // deshabilitado
+    gpio_set_level(PIN_LED_2, 0);
+}
+
+static void eje3_gpio_init(void)
+{
+    gpio_config_t out_conf = {
+        .pin_bit_mask =
+            (1ULL << PIN_DIR_3 ) |
+            (1ULL << PIN_EN_3  ) |
+            (1ULL << PIN_STEP_3) |
+            (1ULL << PIN_LED_3 ),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    gpio_config(&out_conf);
+
+    gpio_config_t in_conf = {
+        .pin_bit_mask = (1ULL << PIN_HALL_3),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&in_conf);
+
+    gpio_set_level(PIN_DIR_3, DERECHA_3);
+    gpio_set_level(PIN_EN_3, 1); // deshabilitado
+    gpio_set_level(PIN_LED_3, 0);
+}
+
+
+/* ============================================================
+ *                      HOMING eje2 / eje3
+ * ============================================================ */
+
+static void homing_eje2(void)
+{
+    ESP_LOGI(TAG, "[EJE2] Iniciando homing bidireccional...");
+    eje2_gpio_init();
+    eje2_pwm_init(FREQ_BUSQUEDA_HZ_2);
+
+    eje2_enable_driver(true);
     vTaskDelay(pdMS_TO_TICKS(20));
 
-    tarea_de_busqueda_home();
+    int dir_actual = DERECHA_2;
+    eje2_set_dir(dir_actual);
 
-    ESP_LOGI(TAG, "app_main: Proceso completado.");
+    // Caso especial: ya arrancamos sobre el imán
+    if (eje2_hall_read()) {
+        if (eje2_arranque_sobre_iman(&dir_actual)) {
+            ESP_LOGI(TAG, "[EJE2] Homing finalizado directamente en arranque.");
+            return;
+        }
+    } else {
+        ESP_LOGI(TAG, "[EJE2] Arranque normal. Buscando HOME...");
+    }
+
+    // Movimiento continuo buscando el primer imán
+    ESP_LOGI(TAG, "[EJE2] Giro buscando imán a %.0f Hz", (double)FREQ_BUSQUEDA_HZ_2);
+    eje2_set_freq(FREQ_BUSQUEDA_HZ_2);
+    eje2_pwm_start();
+
+    while (1) {
+        // Esperar a tocar un imán
+        eje2_wait_hall_low_estable();
+        eje2_pwm_stop();
+        ESP_LOGI(TAG, "[EJE2] Imán detectado. Analizando si es HOME o ENDSTOP...");
+
+        if (eje2_confirmar_home_o_endstop(&dir_actual)) {
+            break;
+        }
+
+        // no era home: seguimos moviendo en la nueva dirección
+        ESP_LOGI(TAG, "[EJE2] No era HOME. Continuando búsqueda...");
+        eje2_set_freq(FREQ_BUSQUEDA_HZ_2);
+        eje2_pwm_start();
+    }
+
+    eje2_enable_driver(false);
+    eje2_pwm_stop();
+    ESP_LOGI(TAG, "[EJE2] Homing COMPLETO.");
 }
 
-// ---------- APP PRINCIPAL ----------
-void app_main(void){
+static void homing_eje3(void)
+{
+    ESP_LOGI(TAG, "[EJE3] Iniciando homing bidireccional...");
+    eje3_gpio_init();
+    eje3_pwm_init(FREQ_BUSQUEDA_HZ_3);
+
+    eje3_enable_driver(true);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    int dir_actual = DERECHA_3;
+    eje3_set_dir(dir_actual);
+
+    if (eje3_hall_read()) {
+        if (eje3_arranque_sobre_iman(&dir_actual)) {
+            ESP_LOGI(TAG, "[EJE3] Homing finalizado directamente en arranque.");
+            goto done;
+        }
+    } else {
+        ESP_LOGI(TAG, "[EJE3] Arranque normal. Buscando HOME...");
+    }
+
+    ESP_LOGI(TAG, "[EJE3] Giro buscando imán a %.0f Hz", (double)FREQ_BUSQUEDA_HZ_3);
+    eje3_set_freq(FREQ_BUSQUEDA_HZ_3);
+    eje3_pwm_start();
+
+    while (1) {
+        eje3_wait_hall_low_estable();
+        eje3_pwm_stop();
+        ESP_LOGI(TAG, "[EJE3] Imán detectado. Analizando si es HOME o ENDSTOP...");
+
+        if (eje3_confirmar_home_o_endstop(&dir_actual)) {
+            break;
+        }
+
+        ESP_LOGI(TAG, "[EJE3] No era HOME. Continuando búsqueda...");
+        eje3_set_freq(FREQ_BUSQUEDA_HZ_3);
+        eje3_pwm_start();
+    }
+
+    eje3_pwm_stop();
+
+done:
+    eje3_enable_driver(false);
+    eje3_pwm_stop();
+    ESP_LOGI(TAG, "[EJE3] Homing COMPLETO.");
+}
+
+
+/* ============================================================
+ *                      MAIN
+ * ============================================================ */
+
+void app_main(void)
+{
+    // Homing secuencial: eje1 -> eje2 -> eje3
     homing_eje1();
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(500));
+
     homing_eje2();
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    homing_eje3();
 }
+
