@@ -21,7 +21,7 @@
 
 // SPI pins
 #define GPIO_MOSI        13
-#define GPIO_MISO        19
+#define GPIO_MISO        12
 #define GPIO_SCLK        14
 #define GPIO_CS          15
 
