@@ -1,6 +1,9 @@
+#!/usr/bin/env python3
 import sys
 import os
 import time
+import math
+import errno
 from dataclasses import dataclass
 from typing import Optional
 
@@ -16,573 +19,483 @@ except Exception:
         except Exception:
             from PyQt5 import QtWidgets, QtCore, QtGui
 
-# HiDPI tweaks
-try:
-    QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
-    QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
-except Exception:
-    pass
-
 FIFO_PATH = "/tmp/spi_tx"
 FIFO_RX_PATH = "/tmp/spi_rx"
 
 def run_dialog(dlg: QtWidgets.QDialog) -> int:
     return dlg.exec() if hasattr(dlg, "exec") else dlg.exec_()
 
-@dataclass
-class Command:
-    type: str
-    payload: dict
+# ==========================================
+# ==== CONFIGURACIÓN DE PASOS ====
+# ==========================================
 
-# ==== FIFO helpers ====
-def spi_send_three(a: int, b: int, c: int):
-    try:
-        with open(FIFO_PATH, "a") as f:
-            f.write(f"I {int(a)} {int(b)} {int(c)}\n")
-    except Exception as e:
-        # Ignoramos errores si es solo polling (comando 0) para no saturar la consola
-        if a != 0:
-            print(f"[SPI-FIFO] No pude escribir: {e}")
+CALIBRACION_PASOS_GRADO = 71.11
+ANGULO_PRUEBA = 80.0 
 
-def jog_start(direction: str):
-    dir_map = {"left":3, "right":4, "up":1, "down":2}
-    spi_send_three(210, dir_map.get(direction, 0), 0)
+PASOS_POR_GRADO_1 = CALIBRACION_PASOS_GRADO
+PASOS_POR_GRADO_2 = CALIBRACION_PASOS_GRADO
+PASOS_POR_GRADO_3 = CALIBRACION_PASOS_GRADO
 
-def jog_stop():
-    spi_send_three(211, 0, 0)
+STEPS_OBJETIVO = ANGULO_PRUEBA * CALIBRACION_PASOS_GRADO
 
-# ==== sizing ====
-def screen_metrics(widget=None):
-    app = QtWidgets.QApplication.instance()
-    scr = None
-    try:
-        if widget is not None and hasattr(app, "screenAt"):
-            scr = app.screenAt(widget.mapToGlobal(QtCore.QPoint(0, 0)))
-    except Exception:
-        scr = None
-    if scr is None:
-        scr = app.primaryScreen()
-    g = scr.availableGeometry()
-    try:
-        dpi = scr.logicalDotsPerInch()
-    except Exception:
-        dpi = 96.0
-    return g.width(), g.height(), dpi
+# ==== CONFIGURACIÓN CINEMÁTICA ====
+L_BASE_OFFSET = 200.0
+L_BRAZO = 250.0
+L_ANTEBRAZO = 250.0
+
+LIM_EJE1 = (-180, 180)
+LIM_EJE2 = (-90 ,  90)
+LIM_EJE3 = (-90 ,  90)
+
+PRESET_POINTS = [
+    [STEPS_OBJETIVO,  STEPS_OBJETIVO,  STEPS_OBJETIVO, f"P1 (Todos a +{ANGULO_PRUEBA:.0f} grados)"],
+    [-STEPS_OBJETIVO, -STEPS_OBJETIVO, -STEPS_OBJETIVO, f"P2 (Todos a -{ANGULO_PRUEBA:.0f} grados)"],
+    [STEPS_OBJETIVO/2, STEPS_OBJETIVO/2  , STEPS_OBJETIVO/2, "P3 (Mitad de recorrido)"],
+    [-STEPS_OBJETIVO/2,   -STEPS_OBJETIVO/2, -STEPS_OBJETIVO/2, "P4 (Mitad negativo)"],
+    [STEPS_OBJETIVO/4,   STEPS_OBJETIVO/4, STEPS_OBJETIVO/4, "P5 (Cuarto de recorrido)"],
+    [-STEPS_OBJETIVO/4,   -STEPS_OBJETIVO/4, -STEPS_OBJETIVO/4, "P6 (Cuarto negativo)"],
+    [300, 200, 250, "Punto Lateral 1 (XYZ)"],
+    [200, 150, 300, "Punto Cercano (XYZ)"],
+    [350, -100, 250, "Punto Intermedio (XYZ)"],
+    [480,   0, 250, "Extensión Máxima (XYZ)"],
+    [100, 300, 300, "Punto Izquierda (XYZ)"],
+    [250,   0, 350, "Punto Retraído Arriba (XYZ)"],
+]
 
 def compute_units(widget=None):
-    w,h,dpi = screen_metrics(widget)
+    app = QtWidgets.QApplication.instance()
+    scr = app.primaryScreen()
+    if widget and hasattr(app, "screenAt"):
+        s = app.screenAt(widget.mapToGlobal(QtCore.QPoint(0,0)))
+        if s: scr = s
+    g = scr.availableGeometry()
+    dpi = scr.logicalDotsPerInch() if hasattr(scr, "logicalDotsPerInch") else 96.0
+    w, h = g.width(), g.height()
     side_min = min(w, h)
     U = max(30, min(int(side_min/13), 100))
-    dpi_sf = dpi/96.0 if dpi and dpi>0 else 1.0
-    if dpi_sf>0: U = int(U/dpi_sf)
-    sizes = {
-        "U":U, "btn_big":int(U*1.45), "btn_small":int(U*0.95),
-        "pad":int(U*0.26), "radius":int(U*0.22),
-        "font_delta_big":2, "font_delta_norm":1,
-    }
-    sizes["btn_big"]   = max(54, min(sizes["btn_big"], 120))
+    dpi_sf = dpi/96.0 if dpi > 0 else 1.0
+    if dpi_sf > 0: U = int(U/dpi_sf)
+    sizes = { "U":U, "btn_big":int(U*1.45), "btn_small":int(U*0.95), "pad":int(U*0.26), "radius":int(U*0.22) }
+    sizes["btn_big"] = max(54, min(sizes["btn_big"], 120))
     sizes["btn_small"] = max(38, min(sizes["btn_small"], 86))
-    sizes["pad"]       = max(6,  min(sizes["pad"], 16))
-    sizes["radius"]    = max(6,  min(sizes["radius"], 12))
+    sizes["pad"] = max(6, min(sizes["pad"], 16))
+    sizes["radius"] = max(6, min(sizes["radius"], 12))
     return sizes
 
-# ==== Diálogos ====
-class ManualDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None, base_speed=50):
-        super().__init__(parent)
-        self.setWindowTitle("Modo manual")
-        self.setModal(True)
-        S = compute_units(self)
+# ==== KINEMATICS ====
+class Kinematics:
+    def __init__(self): 
+        self.theta1, self.theta2, self.theta3 = 0.0, 0.0, 0.0
+        self.curr_x, self.curr_y, self.curr_z = self.forward_kinematics_xyz(0.0, 0.0, 0.0)
+        print(f"Inicio Software: Angulos=(0,0,0) -> Pos XYZ=({self.curr_x:.0f}, {self.curr_y:.0f}, {self.curr_z:.0f})")
+
+    def forward_kinematics_xyz(self, d1, d2, d3):
+        t1 = math.radians(d1); t2 = math.radians(d2); t3 = math.radians(d3)
+        r = L_BRAZO * math.cos(t2) + L_ANTEBRAZO * math.cos(t2 + t3)
+        z = L_BASE_OFFSET + L_BRAZO * math.sin(t2) + L_ANTEBRAZO * math.sin(t2 + t3)
+        x = r * math.cos(t1)
+        y = r * math.sin(t1)
+        return x, y, z
+
+    def calculate_ik(self, tx, ty, tz):
+        t1_rad = math.atan2(ty, tx)
+        r = math.sqrt(tx**2 + ty**2)
+        z_prime = tz - L_BASE_OFFSET
+        D = math.sqrt(r**2 + z_prime**2)
+
+        if D > (L_BRAZO + L_ANTEBRAZO): return None
+        if D < abs(L_BRAZO - L_ANTEBRAZO): return None
+
+        numerator = (r**2 + z_prime**2 - L_BRAZO**2 - L_ANTEBRAZO**2)
+        denominator = (2 * L_BRAZO * L_ANTEBRAZO)
+        if denominator == 0: return None
         
-        # Este es el valor que devolveremos
-        self._value = 0
-        self.base_speed = base_speed # <-- AÑADIDO
+        cos_t3 = numerator / denominator
+        cos_t3 = max(-1.0, min(1.0, cos_t3))
+        t3_rad = math.acos(cos_t3)
 
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(S["pad"], S["pad"], S["pad"], S["pad"])
-        lay.setSpacing(int(S["pad"]*0.7))
-
-        self.info = QtWidgets.QLabel("Seleccioná el eje y activá el movimiento.") # Texto cambiado
-        self.info.setWordWrap(True)
-
-        axis_row = QtWidgets.QHBoxLayout()
-        axis_row.addWidget(QtWidgets.QLabel("Eje a mover:"))
-        self.axis_combo = QtWidgets.QComboBox()
-        self.axis_combo.addItems([f"Eje {i}" for i in range(1,4)]) # Ejes 1, 2, 3
-        axis_row.addWidget(self.axis_combo)
-        axis_box = QtWidgets.QGroupBox("Selección de eje")
-        axis_box.setLayout(axis_row)
-
-        # --- REEMPLAZO POR BOTONES ESTILO FLECHA ---
-        btn_layout = QtWidgets.QHBoxLayout()
+        alpha = math.atan2(z_prime, r)
+        beta_num = (r**2 + z_prime**2 + L_BRAZO**2 - L_ANTEBRAZO**2)
+        beta_den = (2 * D * L_BRAZO)
+        if beta_den == 0: return None
         
-        # Copiamos la lógica de estilo de la ventana principal (parent)
-        # Asumimos que parent es RobotUI
-        parent_S = self.parent().S if self.parent() and hasattr(self.parent(), "S") else S
-        S_btn_size = parent_S["btn_big"]
-        S_pad = max(6, int(parent_S["pad"]*0.6))
-        S_radius = parent_S["radius"]
-        S_font = self.parent()._button_font(self.font(), True) if self.parent() and hasattr(self.parent(), "_button_font") else self.font()
+        beta_val = max(-1.0, min(1.0, beta_num / beta_den))
+        beta = math.acos(beta_val)
+        t2_rad = alpha + beta
 
-        # Botón Negativo (◀)
-        self.btn_neg = QtWidgets.QPushButton("◀")
-        self.btn_neg.setToolTip("Mover eje en dirección negativa")
-        self.btn_neg.setMinimumSize(S_btn_size, S_btn_size)
-        self.btn_neg.setFont(S_font)
-        self.btn_neg.setStyleSheet(
-            "QPushButton { background-color:#ff9800; color:#fff;"
-            f"  padding:{S_pad}px {S_pad+4}px; border:none; border-radius:{S_radius}px; font-weight:700; }}"
-            "QPushButton:hover{ background-color:#fb8c00; }"
-            "QPushButton:pressed{ background-color:#e65100; }"
-        )
+        d1 = math.degrees(t1_rad)
+        d2 = math.degrees(t2_rad)
+        d3 = -math.degrees(t3_rad)
 
-        # Botón Stop (■)
-        self.btn_stop = QtWidgets.QPushButton("■")
-        self.btn_stop.setToolTip("Detener eje")
-        self.btn_stop.setMinimumSize(S_btn_size, S_btn_size)
-        self.btn_stop.setFont(S_font)
-        self.btn_stop.setStyleSheet(
-            "QPushButton { background-color:#c62828; color:#fff; border:none;"
-            f"  padding:{S_pad}px {S_pad+4}px; border-radius:{S_radius}px; font-weight:700; }}"
-            "QPushButton:hover{ background-color:#d32f2f; }"
-            "QPushButton:pressed{ background-color:#b71c1c; }"
-        )
+        if not (LIM_EJE1[0] <= d1 <= LIM_EJE1[1]): return None
+        if not (LIM_EJE2[0] <= d2 <= LIM_EJE2[1]): return None
+        if not (LIM_EJE3[0] <= d3 <= LIM_EJE3[1]): return None
 
-        # Botón Positivo (▶)
-        self.btn_pos = QtWidgets.QPushButton("▶")
-        self.btn_pos.setToolTip("Mover eje en dirección positiva")
-        self.btn_pos.setMinimumSize(S_btn_size, S_btn_size)
-        self.btn_pos.setFont(S_font)
-        self.btn_pos.setStyleSheet(
-            "QPushButton { background-color:#ff9800; color:#fff;"
-            f"  padding:{S_pad}px {S_pad+4}px; border:none; border-radius:{S_radius}px; font-weight:700; }}"
-            "QPushButton:hover{ background-color:#fb8c00; }"
-            "QPushButton:pressed{ background-color:#e65100; }"
-        )
+        return (d1, d2, d3)
 
-        btn_layout.addWidget(self.btn_neg)
-        btn_layout.addWidget(self.btn_stop)
-        btn_layout.addWidget(self.btn_pos)
-        # --- FIN REEMPLAZO ---
+    def update_target(self, x, y, z):
+        res = self.calculate_ik(x, y, z)
+        if res:
+            self.curr_x, self.curr_y, self.curr_z = x, y, z
+            self.theta1, self.theta2, self.theta3 = res
+            return True, res
+        return False, None
 
-        # Nuevo label de estado
-        self.status_label = QtWidgets.QLabel("VELOCIDAD: 0")
-        self.status_label.setAlignment(QtCore.Qt.AlignCenter)
-        f = self.status_label.font(); f.setPointSize(f.pointSize()+S["font_delta_norm"]); f.setBold(True)
-        self.status_label.setFont(f)
-
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok|QtWidgets.QDialogButtonBox.Cancel)
-
-        lay.addWidget(self.info)
-        lay.addWidget(axis_box)
-        
-        # Añadir los nuevos widgets
-        lay.addLayout(btn_layout)
-        lay.addWidget(self.status_label)
-        
-        lay.addWidget(btns)
-
-        # Conectar botones
-        self.btn_neg.clicked.connect(lambda: self._set_speed(-self.base_speed)) # <-- MODIFICADO
-        self.btn_pos.clicked.connect(lambda: self._set_speed(self.base_speed))  # <-- MODIFICADO
-        self.btn_stop.clicked.connect(lambda: self._set_speed(0))   # 0 para stop
-
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        
-        self._set_speed(0) # Estado inicial
-
-    def _set_speed(self, speed):
-        self._value = speed
-        self.status_label.setText(f"VELOCIDAD: {speed}")
-        if speed == 0:
-            self.status_label.setStyleSheet("color: #c62828; font-weight: 700;") # Rojo
-        else:
-            self.status_label.setStyleSheet("color: #2e7d32; font-weight: 700;") # Verde
-
-    def _activate(self):
-        # Esta función ya no se usa, pero la dejamos por si acaso
-        self._set_speed(50)
-    def _deactivate(self):
-        # Esta función ya no se usa
-        self._set_speed(0)
-
-    def value(self) -> int: 
-        return int(self._value) # Devuelve el valor guardado
-    
-    def axis(self) -> int:  
-        return self.axis_combo.currentIndex()+1
-
-class SpeedDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None, initial_value=50):
-        super().__init__(parent)
-        self.setWindowTitle("Velocidad")
-        self.setModal(True)
-        S = compute_units(self)
-
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(S["pad"], S["pad"], S["pad"], S["pad"])
-        lay.setSpacing(int(S["pad"]*0.7))
-
-        self.lbl = QtWidgets.QLabel("Seleccioná la velocidad (0–100).")
-        self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.slider.setRange(0,100)
-        self.slider.setSingleStep(1); self.slider.setPageStep(5)
-
-        self.spin = QtWidgets.QSpinBox(); self.spin.setRange(0,100)
-        self.slider.valueChanged.connect(self.spin.setValue)
-        self.spin.valueChanged.connect(self.slider.setValue)
-        self.slider.setValue(initial_value) # <-- MODIFICADO
-
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok|QtWidgets.QDialogButtonBox.Cancel)
-        lay.addWidget(self.lbl); lay.addWidget(self.slider); lay.addWidget(self.spin); lay.addWidget(btns)
-        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject)
-
-    def value(self) -> int: return int(self.spin.value())
+robot = Kinematics()
 
 # -----------------------------------------------------------------
-# Hilo para LEER el estado desde el C Bridge
+# Hilo lector (Rx)
 # -----------------------------------------------------------------
 class StatusReader(QtCore.QObject):
-    # Señales correctas para qtpy/PyQt5/PySide6
-    statusReceived = QtCore.pyqtSignal(str)  # <-- CAMBIADO A pyqtSignal
-    finished = QtCore.pyqtSignal()           # <-- CAMBIADO A pyqtSignal
-
+    statusReceived = QtCore.pyqtSignal(str)
     def __init__(self):
         super().__init__()
         self.is_running = True
-        print(f"[Reader] Hilo lector inicializado.")
-
     def run(self):
-        print(f"[Reader] Iniciando bucle de lectura en {FIFO_RX_PATH}...")
         while self.is_running:
             try:
-                # Si no existe el FIFO, esperar un poco para no saturar CPU
                 if not os.path.exists(FIFO_RX_PATH):
-                        time.sleep(1)
-                        continue
-
-                # Abrir en modo bloqueo (esperará a que el C bridge lo abra)
-                with open(FIFO_RX_PATH, 'r') as fifo_rx:
-                    print(f"[Reader] FIFO conectado. Escuchando...")
+                    time.sleep(1); continue
+                with open(FIFO_RX_PATH, 'r') as fifo:
                     while self.is_running:
-                        line = fifo_rx.readline()
-                        if line:
-                            status = line.strip()
-                            if status:
-                                self.statusReceived.emit(status)
-                        else:
-                            # EOF: el otro lado cerró el FIFO
-                            if self.is_running:
-                                print("[Reader] FIFO cerrado por el otro extremo. Reintentando...")
-                                time.sleep(1)
-                            break 
-            except Exception as e:
-                if self.is_running:
-                    print(f"[Reader] Error de lectura: {e}")
-                    time.sleep(2)
+                        line = fifo.readline()
+                        if line: self.statusReceived.emit(line.strip())
+                        else: time.sleep(1); break
+            except Exception: time.sleep(1)
+    def stop(self): self.is_running = False
+
+# ==== DIÁLOGOS ====
+class ManualDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None, sender_callback=None):
+        super().__init__(parent)
+        self.setWindowTitle("Modo Manual")
+        self.sender = sender_callback
+        S = compute_units(self)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(S["pad"],S["pad"],S["pad"],S["pad"])
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Eje:"))
+        self.combo = QtWidgets.QComboBox()
+        self.combo.addItems(["Eje 1","Eje 2","Eje 3"])
+        row.addWidget(self.combo); lay.addLayout(row)
+
+        btns = QtWidgets.QHBoxLayout()
+        self.b_ccw = QtWidgets.QPushButton("◀ (-)"); btns.addWidget(self.b_ccw)
+        self.b_stop = QtWidgets.QPushButton("■ STOP"); btns.addWidget(self.b_stop)
+        self.b_cw = QtWidgets.QPushButton("▶ (+)"); btns.addWidget(self.b_cw)
+        lay.addLayout(btns)
+
+        self.lbl = QtWidgets.QLabel("Listo")
+        self.lbl.setAlignment(QtCore.Qt.AlignCenter); lay.addWidget(self.lbl)
+
+        self.b_ccw.pressed.connect(lambda: self.mv(2))
+        self.b_ccw.released.connect(lambda: self.mv(0))
+        self.b_cw.pressed.connect(lambda: self.mv(1))
+        self.b_cw.released.connect(lambda: self.mv(0))
+        self.b_stop.clicked.connect(lambda: self.mv(0))
+
+    def mv(self, d):
+        base = 601 + self.combo.currentIndex()
+        txt = "STOP"
+        if d==1: txt="CW (+)"
+        elif d==2: txt="CCW (-)"
+        self.lbl.setText(f"Eje {self.combo.currentIndex()+1}: {txt}")
+        if self.sender: self.sender(base, d, 0)
+
+class PresetMoveDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None, sender_callback=None):
+        super().__init__(parent)
+        self.setWindowTitle("Mover a Punto Predefinido")
+        self.resize(350, 200)
+        lay = QtWidgets.QVBoxLayout(self)
         
-        print("[Reader] Bucle terminado.")
-        self.finished.emit()
+        info = QtWidgets.QLabel(f"Ratio Actual: {CALIBRACION_PASOS_GRADO:.2f} pasos/grado")
+        info.setStyleSheet("color: blue; font-weight: bold;")
+        lay.addWidget(info)
 
-    def stop(self):
-        self.is_running = False
+        lay.addWidget(QtWidgets.QLabel("Selecciona un punto objetivo:"))
+        self.combo_points = QtWidgets.QComboBox()
+        for pt in PRESET_POINTS:
+            self.combo_points.addItem(f"{pt[3]}")
+        lay.addWidget(self.combo_points)
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+    def get_selected_point_index(self):
+        return self.combo_points.currentIndex()
 
-# ==== Ventana principal ====
+# ==== VENTANA PRINCIPAL ====
 class RobotUI(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Robot Arm Controller")
+        self.setWindowTitle("Control Robot - PTP/MoveJ")
         self.S = compute_units(self)
-        self.is_stopped = False
-        self.current_speed = 50 # <-- AÑADIDO: Guardar estado de velocidad
 
-        self.btn_up      = self._make_dir_button("▲", "Arriba", True)
-        self.btn_down    = self._make_dir_button("▼", "Abajo",  True)
-        self.btn_left    = self._make_dir_button("◀", "Izquierda", True)
-        self.btn_right   = self._make_dir_button("▶", "Derecha",    True)
-
-        self.btn_stop_play = self._make_dir_button("■", "Stop / Play (Espacio)", False)
-        self._apply_stop_style()
-        self.btn_pause = self._make_dir_button("PAUSE", "Pausa", False)
-
-        self.btn_manual = self._make_round_button("MM", "MODO MANUAL")
-        self.btn_speed  = self._make_round_button("VEL", "VELOCIDAD")
-
-        self.x_in = self._make_spin("X (mm)", -10000, 10000, 0.1, 0.0)
-        self.y_in = self._make_spin("Y (mm)", -10000, 10000, 0.1, 0.0)
-        self.z_in = self._make_spin("Z (mm)", -10000, 10000, 0.1, 0.0)
-
-        self.btn_move_abs = QtWidgets.QPushButton("Move To (X, Y, Z)")
-        self.btn_home     = QtWidgets.QPushButton("Home")
-        self.log          = QtWidgets.QPlainTextEdit(readOnly=True)
-        self.log.setPlaceholderText("Log de comandos…")
-
-        central = QtWidgets.QWidget(); self.setCentralWidget(central)
-        root = QtWidgets.QGridLayout(central)
-        root.setContentsMargins(self.S["pad"], self.S["pad"], self.S["pad"], self.S["pad"])
-        root.setHorizontalSpacing(int(self.S["pad"]*0.8)); root.setVerticalSpacing(int(self.S["pad"]*0.8))
-
-        pad = QtWidgets.QGridLayout()
-        pad.setHorizontalSpacing(int(self.S["pad"]*0.6)); pad.setVerticalSpacing(int(self.S["pad"]*0.6))
-        pad.addWidget(self.btn_up,        0, 1)
-        pad.addWidget(self.btn_left,      1, 0)
-        pad.addWidget(self.btn_stop_play, 1, 1)
-        pad.addWidget(self.btn_right,     1, 2)
-        pad.addWidget(self.btn_down,      2, 1)
-        pad.addWidget(self.btn_pause,     3, 1)
-        root.addWidget(self._group("Direcciones", pad), 0, 0)
-
-        col_circ = QtWidgets.QVBoxLayout()
-        col_circ.setSpacing(int(self.S["pad"]*0.6))
-        col_circ.addWidget(self.btn_manual, alignment=QtCore.Qt.AlignTop|QtCore.Qt.AlignHCenter)
-        col_circ.addWidget(self.btn_speed,  alignment=QtCore.Qt.AlignTop|QtCore.Qt.AlignHCenter)
-        col_circ.addStretch(1)
-        circ_box = self._group("Controles", col_circ)
-        circ_box.setMaximumWidth(int(self.S["btn_big"]*1.5))
-        root.addWidget(circ_box, 0, 1)
-
-        form = QtWidgets.QFormLayout()
-        form.addRow(self.x_in["label"], self.x_in["spin"])
-        form.addRow(self.y_in["label"], self.y_in["spin"])
-        form.addRow(self.z_in["label"], self.z_in["spin"])
-        root.addWidget(self._group("Entradas", form), 0, 2)
-
-        actions = QtWidgets.QHBoxLayout()
-        actions.addWidget(self.btn_move_abs); actions.addWidget(self.btn_home)
-        root.addWidget(self._group("Acciones", actions), 1, 0, 1, 3)
-
-        log_box = self._group("Consola", QtWidgets.QVBoxLayout())
-        log_box.layout().addWidget(self.log)
-        root.addWidget(log_box, 2, 0, 1, 3)
-
-        self._wire_buttons()
-        self._install_shortcuts()
-
-        # --- Inicialización de estado y lector ---
+        self.fd_tx = None 
+        # === ESTADOS ===
         self.is_homing = False
-        self.setup_status_reader_thread()
+        self.is_moving_ptp = False
         
-        # Timer para polling periódico
+        # Variable para evitar el cartel inmediato
+        self.ignore_status_until = 0.0
+
+        # UI
+        central = QtWidgets.QWidget(); self.setCentralWidget(central)
+        lay = QtWidgets.QVBoxLayout(central)
+
+        self.lbl_xyz = QtWidgets.QLabel("XYZ: ...")
+        self.lbl_ang = QtWidgets.QLabel("Ang: ...")
+        self.lbl_status = QtWidgets.QLabel("IDLE")
+        self.lbl_xyz.setStyleSheet("font-size:14px; font-weight:bold; color:blue;")
+        lay.addWidget(self.lbl_xyz); lay.addWidget(self.lbl_ang); lay.addWidget(self.lbl_status)
+
+        grid = QtWidgets.QGridLayout()
+        self.b_up = QtWidgets.QPushButton("▲ E2+")
+        self.b_dn = QtWidgets.QPushButton("▼ E2-")
+        self.b_lt = QtWidgets.QPushButton("◀ E1-")
+        self.b_rt = QtWidgets.QPushButton("▶ E1+")
+        self.b_home = QtWidgets.QPushButton("HOME")
+        self.b_man = QtWidgets.QPushButton("Manual")
+        self.b_ptp = QtWidgets.QPushButton("MOVE PTP")
+
+        grid.addWidget(self.b_up, 0, 1)
+        grid.addWidget(self.b_lt, 1, 0)
+        grid.addWidget(self.b_home, 1, 1)
+        grid.addWidget(self.b_rt, 1, 2)
+        grid.addWidget(self.b_dn, 2, 1)
+        grid.addWidget(self.b_man, 3, 0, 1, 3)
+        grid.addWidget(self.b_ptp, 4, 0, 1, 3)
+        lay.addLayout(grid)
+
+        self.log = QtWidgets.QPlainTextEdit(readOnly=True)
+        lay.addWidget(self.log)
+
+        # Conexiones
+        self.b_up.clicked.connect(lambda: self.move_joint(2, 5))
+        self.b_dn.clicked.connect(lambda: self.move_joint(2, -5))
+        self.b_lt.clicked.connect(lambda: self.move_joint(1, -5))
+        self.b_rt.clicked.connect(lambda: self.move_joint(1, 5))
+        self.b_home.clicked.connect(self.do_home)
+        self.b_man.clicked.connect(self._open_manual_dialog)
+        self.b_ptp.clicked.connect(self._open_preset_dialog)
+
+        self.resize(400, 500)
+
+        self.last_a1 = robot.theta1
+        self.last_a2 = robot.theta2
+        self.last_a3 = robot.theta3
+        self.update_labels()
+
+        self.setup_status_reader_thread()
         self.poll_timer = QtCore.QTimer(self)
         self.poll_timer.timeout.connect(self.poll_status)
-        self.poll_timer.start(250)
+        self.poll_timer.start(1000)
 
-        for b in (self.btn_up, self.btn_down, self.btn_left, self.btn_right,
-                  self.btn_stop_play, self.btn_pause, self.btn_move_abs, self.btn_home):
-            b.setMinimumHeight(int(self.S["btn_big"]*0.55))
-        for spin in (self.x_in, self.y_in, self.z_in):
-            spin["spin"].setMinimumWidth(int(self.S["btn_small"]*1.8))
+    # --- CONEXIÓN FIFO ---
+    def connect_fifo(self):
+        if self.fd_tx is not None: return
+        if not os.path.exists(FIFO_PATH): return
+        try:
+            self.fd_tx = os.open(FIFO_PATH, os.O_WRONLY | os.O_NONBLOCK)
+            self.log_cmd("FIFO TX conectado.")
+        except OSError as e:
+            if e.errno != errno.ENXIO: self.log_cmd(f"FIFO Err: {e}")
 
-        try: self.showMaximized()
-        except Exception: self.resize(980,560)
+    def close_fifo(self):
+        if self.fd_tx is not None:
+            try: os.close(self.fd_tx)
+            except Exception: pass
+            self.fd_tx = None
 
-    def _group(self, title, inner_layout):
-        box = QtWidgets.QGroupBox(title); box.setLayout(inner_layout); return box
-    def _button_font(self, base_font, big=False):
-        f = QtGui.QFont(base_font); f.setBold(True)
-        f.setPointSize(f.pointSize() + (self.S["font_delta_big"] if big else self.S["font_delta_norm"]))
-        return f
-    def _make_dir_button(self, text, tooltip, orange=False):
-        btn = QtWidgets.QPushButton(text); btn.setToolTip(tooltip)
-        size = self.S["btn_big"]; btn.setMinimumSize(size, size); btn.setFont(self._button_font(btn.font(), True))
-        pad = max(6, int(self.S["pad"]*0.6)); radius = self.S["radius"]
-        base = ( "QPushButton {"
-                 f"  padding:{pad}px {pad+4}px; border:none; border-radius:{radius}px; }}"
-                 "QPushButton:pressed { background-color:#ccc; } " ) # <-- FIX DE CSS
-        if orange:
-            base += "QPushButton { background-color:#ff9800; color:#fff; }" \
-                    "QPushButton:hover{ background-color:#fb8c00; }" \
-                    "QPushButton:pressed{ background-color:#e65100; }"
+    def send_spi(self, cmd, a1, a2):
+        if self.fd_tx is None:
+            self.connect_fifo()
+            if self.fd_tx is None: return
+
+        msg = f"I {int(cmd)} {int(a1)} {int(a2)}\n".encode()
+        try:
+            os.write(self.fd_tx, msg)
+            if cmd != 0: self.log_cmd(f"TX: {cmd} {a1} {a2}")
+        except OSError as e:
+            if e.errno == errno.EPIPE: self.close_fifo()
+            elif e.errno != errno.EAGAIN: self.log_cmd(f"Err TX: {e}"); self.close_fifo()
+
+    # --- MOVIMIENTOS ---
+
+    def move_joint(self, axis, delta):
+        if self.is_homing or self.is_moving_ptp: return
+        a1, a2, a3 = robot.theta1, robot.theta2, robot.theta3
+
+        if axis == 1: a1 += delta
+        elif axis == 2: a2 += delta
+        elif axis == 3: a3 += delta
+
+        a1 = max(LIM_EJE1[0], min(LIM_EJE1[1], a1))
+        a2 = max(LIM_EJE2[0], min(LIM_EJE2[1], a2))
+        a3 = max(LIM_EJE3[0], min(LIM_EJE3[1], a3))
+
+        x, y, z = robot.forward_kinematics_xyz(a1, a2, a3)
+
+        ok, angs = robot.update_target(x, y, z)
+        if ok:
+            self.update_labels()
+            self.send_kinematic_move(*angs)
         else:
-            base += "QPushButton { background-color:#e0e0e0; color:#222; }" \
-                    "QPushButton:hover{ background-color:#d5d5d5; }" \
-                    "QPushButton:pressed{ background-color:#bdbdbd; }"
-        btn.setStyleSheet(base); return btn
-    def _apply_stop_style(self):
-        pad = max(6, int(self.S["pad"]*0.6)); radius = self.S["radius"]
-        if self.is_stopped:
-            self.btn_stop_play.setText("▶"); self.btn_stop_play.setToolTip("Play / Reanudar (Espacio)")
-            self.btn_stop_play.setStyleSheet(
-                "QPushButton { background-color:#2e7d32; color:#fff; border:none;"
-                f"  padding:{pad}px {pad+4}px; border-radius:{radius}px; font-weight:700; }}"
-                "QPushButton:hover{ background-color:#388e3c; }"
-                "QPushButton:pressed{ background-color:#1b5e20; }")
-        else:
-            self.btn_stop_play.setText("■"); self.btn_stop_play.setToolTip("Stop (Espacio)")
-            self.btn_stop_play.setStyleSheet(
-                "QPushButton { background-color:#c62828; color:#fff; border:none;"
-                f"  padding:{pad}px {pad+4}px; border-radius:{radius}px; font-weight:700; }}"
-                "QPushButton:hover{ background-color:#d32f2f; }"
-                "QPushButton:pressed{ background-color:#b71c1c; }")
-    def _make_round_button(self, text, tooltip):
-        btn = QtWidgets.QPushButton(text); btn.setToolTip(tooltip)
-        size = self.S["btn_small"]; btn.setFixedSize(size, size)
-        btn.setFont(self._button_font(btn.font(), False))
-        border = max(2, int(size*0.03))
-        btn.setStyleSheet(
-            "QPushButton { background-color:#e0e0e0; color:#333;"
-            f"  border-radius:{size//2}px; border:{border}px solid #9e9e9e; font-weight:700; }}"
-            "QPushButton:hover{ background-color:#d5d5d5; }"
-            "QPushButton:pressed{ background-color:#cfcfcf; }")
-        return btn
-    def _make_spin(self, label, mn, mx, step, value):
-        spin = QtWidgets.QDoubleSpinBox(); spin.setRange(mn, mx)
-        spin.setDecimals(3 if step<1 else 1); spin.setSingleStep(step); spin.setValue(value)
-        spin.setAlignment(QtCore.Qt.AlignRight)
-        f = spin.font(); f.setPointSize(f.pointSize()+self.S["font_delta_norm"]); spin.setFont(f)
-        lab = QtWidgets.QLabel(label); f2 = lab.font(); f2.setPointSize(f2.pointSize()+self.S["font_delta_norm"]); lab.setFont(f2)
-        return {"label": lab, "spin": spin}
+            self.log_cmd("Límite alcanzado")
 
-    def _install_shortcuts(self):
-        QtWidgets.QShortcut(QtGui.QKeySequence("Left"),  self, activated=lambda: jog_start("left"))
-        QtWidgets.QShortcut(QtGui.QKeySequence("Right"), self, activated=lambda: jog_start("right"))
-        QtWidgets.QShortcut(QtGui.QKeySequence("Space"), self, activated=self._toggle_stop_play)
-        # --- SIMULACIÓN: Tecla 'H' para forzar fin de Homing ---
-        QtWidgets.QShortcut(QtGui.QKeySequence("H"), self, activated=self._simular_fin_homing)
+    def _open_preset_dialog(self):
+        if self.is_homing or self.is_moving_ptp: return
+        dlg = PresetMoveDialog(self)
+        if run_dialog(dlg) == QtWidgets.QDialog.Accepted:
+            idx = dlg.get_selected_point_index()
+            px, py, pz, name = PRESET_POINTS[idx]
+            
+            targets_pasos = ["P1", "P2", "P3", "P4", "P5", "P6"]
+            
+            # --- LIMPIEZA DE BANDERAS Y SETEO DE ESTADO ---
+            self.is_homing = False          # Nos aseguramos que NO es homing
+            self.is_moving_ptp = True       # Activamos PTP
+            
+            # MAGIA: Ignorar reportes de estado por 1.5 segundos para que arranque
+            self.ignore_status_until = time.time() + 1.5
+            
+            self.lbl_status.setText("MOVIENDO...")
+            self.lbl_status.setStyleSheet("color: orange")
 
-    def _simular_fin_homing(self):
-        print("[SIM] Tecla 'H' presionada: Forzando fin de Homing.")
-        self.is_homing = True # Forzamos estado para que el handler lo acepte
-        self.handle_status("501")
+            if any(t in name for t in targets_pasos):
+                self.log_cmd(f"PTP Directo (Steps->Deg): {name}")
+                t1 = px / PASOS_POR_GRADO_1
+                t2 = py / PASOS_POR_GRADO_2
+                t3 = pz / PASOS_POR_GRADO_3
+                robot.theta1, robot.theta2, robot.theta3 = t1, t2, t3
+                robot.curr_x, robot.curr_y, robot.curr_z = robot.forward_kinematics_xyz(t1, t2, t3)
+                self.update_labels()
+                self.send_kinematic_move(t1, t2, t3)
+            else:
+                self.log_cmd(f"PTP Objetivo (XYZ mm): {name}")
+                ok, angs = robot.update_target(px, py, pz)
+                if ok:
+                    self.update_labels()
+                    self.send_kinematic_move(*angs)
+                else:
+                    self.log_cmd("Error: Punto fuera de rango")
+                    self.is_moving_ptp = False
+                    self.lbl_status.setText("IDLE")
+                    self.lbl_status.setStyleSheet("color:green")
 
-    def _wire_buttons(self):
-        self.btn_left.pressed.connect(lambda: (jog_start("left"),  self.send_command(Command("nudge", {"dir": "left"}))))
-        self.btn_left.released.connect(jog_stop)
-        self.btn_right.pressed.connect(lambda: (jog_start("right"), self.send_command(Command("nudge", {"dir": "right"}))))
-        self.btn_right.released.connect(jog_stop)
-        self.btn_up.pressed.connect(lambda: (jog_start("up"),    self.send_command(Command("nudge", {"dir": "up"}))))
-        self.btn_up.released.connect(jog_stop)
-        self.btn_down.pressed.connect(lambda: (jog_start("down"), self.send_command(Command("nudge", {"dir": "down"}))))
-        self.btn_down.released.connect(jog_stop)
-        self.btn_stop_play.clicked.connect(self._toggle_stop_play)
-        self.btn_pause.clicked.connect(self._pause)
-        self.btn_manual.clicked.connect(self._open_manual_dialog)
-        self.btn_speed.clicked.connect(self._open_speed_dialog)
-        self.btn_move_abs.clicked.connect(self._move_abs)
-        self.btn_home.clicked.connect(self._home)
+    def update_labels(self):
+        self.lbl_xyz.setText(f"X:{robot.curr_x:.0f} Y:{robot.curr_y:.0f} Z:{robot.curr_z:.0f}")
+        self.lbl_ang.setText(f"A1:{robot.theta1:.1f} A2:{robot.theta2:.1f} A3:{robot.theta3:.1f}")
 
-    def _toggle_stop_play(self):
-        if not self.is_stopped:
-            self.send_command(Command("stop", {})); self.is_stopped = True
-            spi_send_three(101, 0, 0)
-        else:
-            self.send_command(Command("play", {})); self.is_stopped = False
-            spi_send_three(100, 1, 0)
-        self._apply_stop_style()
+    def send_kinematic_move(self, a1, a2, a3):
+        delta_a1 = a1 - self.last_a1
+        delta_a2 = a2 - self.last_a2
+        delta_a3 = a3 - self.last_a3
 
-    def _pause(self):
-        self.send_command(Command("pause", {})); spi_send_three(102, 0, 0)
+        s1 = int(delta_a1 * PASOS_POR_GRADO_1)
+        s2 = int(delta_a2 * PASOS_POR_GRADO_2)
+        s3 = int(delta_a3 * PASOS_POR_GRADO_3)
 
-    def _move_abs(self):
-        x = float(self.x_in["spin"].value()); y = float(self.y_in["spin"].value()); z = float(self.z_in["spin"].value())
-        self.send_command(Command("move_abs", {"x":x, "y":y, "z":z}))
-        spi_send_three(400, int(x*1000), int(y*1000))
+        self.log_cmd(f"Mov: {delta_a1:.1f}/{delta_a2:.1f}/{delta_a3:.1f} gr -> {s1}/{s2}/{s3} steps")
+        self.last_a1, self.last_a2, self.last_a3 = a1, a2, a3
 
-    def _home(self):
-        if self.is_homing:
-            self.log.appendPlainText("WARN: Puesta a 0 ya está en progreso.")
+        if s1==0 and s2==0 and s3==0: 
+            self.is_moving_ptp = False
+            self.lbl_status.setText("IDLE")
+            self.lbl_status.setStyleSheet("color:green")
             return
-        self.send_command(Command("home", {}))
-        spi_send_three(500, 0, 0)
-        self.is_homing = True
-        self.btn_home.setText("Puesta a 0...")
-        self.btn_home.setEnabled(False)
+
+        self.send_spi(400, s1, s2)
+        time.sleep(0.002)
+        self.send_spi(401, s3, 0)
+
+    def do_home(self):
+        # Limpiamos estados
+        self.is_moving_ptp = False
+        self.is_homing = True 
+        
+        # También damos un tiempito de gracia para el Home
+        self.ignore_status_until = time.time() + 1.0
+        
+        self.send_spi(500, 0, 0)
+        self.last_a1, self.last_a2, self.last_a3 = 0.0, 0.0, 0.0
+        robot.theta1, robot.theta2, robot.theta3 = 0.0, 0.0, 0.0
+        robot.curr_x, robot.curr_y, robot.curr_z = robot.forward_kinematics_xyz(0,0,0)
+        self.update_labels()
 
     def _open_manual_dialog(self):
-        dlg = ManualDialog(self, base_speed=self.current_speed) # <-- MODIFICADO
-        if run_dialog(dlg) == QtWidgets.QDialog.Accepted:
-            val = dlg.value(); axis = dlg.axis(); enabled = 1 if val!=0 else 0 # <-- MODIFICADO
-            self.send_command(Command("manual_enable", {"enabled":enabled, "level":val, "axis":axis}))
-            spi_send_three(600, axis, val)
+        run_dialog(ManualDialog(self, self.send_spi))
 
-    def _open_speed_dialog(self):
-        dlg = SpeedDialog(self, initial_value=self.current_speed) # <-- MODIFICADO
-        if run_dialog(dlg) == QtWidgets.QDialog.Accepted:
-            val = dlg.value()
-            self.current_speed = val # <-- AÑADIDO
-            self.send_command(Command("set_speed_pct", {"value":val}))
-            spi_send_three(300, val, 0)
-
-    def send_command(self, cmd: Command):
-        t = cmd.type; p = cmd.payload
-        if t=="nudge": line=f"NUDGE,{p['dir']}"
-        elif t=="move_abs": line=f"MOVE,{p['x']:.3f},{p['y']:.3f},{p['z']:.3f}"
-        elif t=="home": line="HOME"
-        elif t=="stop": line="STOP"
-        elif t=="play": line="PLAY"
-        elif t=="pause": line="PAUSE"
-        elif t=="manual_enable": line=f"MANUAL,{p['enabled']},{p['level']},{p.get('axis',1)}"
-        elif t=="set_speed_pct": line=f"SPEED_PCT,{p['value']}"
-        else: line=f"UNKNOWN,{t}"
-        self.log.appendPlainText(line)
+    def log_cmd(self, t):
+        self.log.appendPlainText(f">> {t}")
         c = self.log.textCursor(); c.movePosition(QtGui.QTextCursor.End); self.log.setTextCursor(c)
 
-    def setup_status_reader_thread(self):
-        self.reader_thread = QtCore.QThread()
-        self.status_reader = StatusReader()
-        self.status_reader.moveToThread(self.reader_thread)
-        self.reader_thread.started.connect(self.status_reader.run)
-        self.status_reader.statusReceived.connect(self.handle_status)
-        self.status_reader.finished.connect(self.reader_thread.quit)
-        self.status_reader.finished.connect(self.status_reader.deleteLater)
-        self.reader_thread.finished.connect(self.reader_thread.deleteLater)
-        self.reader_thread.start()
-        print("[GUI] Hilo lector de estado iniciado.")
-
     def poll_status(self):
-        if not self.is_homing:
-            spi_send_three(0, 0, 0)
+        self.send_spi(0, 0, 0)
 
-    def handle_status(self, status: str):
-        if status == "501" and self.is_homing:
-            print("[GUI] ¡Recibido 501! Homing completado.")
-            self.log.appendPlainText("INFO: Puesta a 0 completada.")
-            self.is_homing = False
-            self.btn_home.setText("Home")
-            self.btn_home.setEnabled(True)
-            self.show_homing_complete_popup()
-        elif status == "500":
-            if not self.is_homing:
-                self.is_homing = True
-                self.btn_home.setText("Puesta a 0...")
-                self.btn_home.setEnabled(False)
+    def setup_status_reader_thread(self):
+        self.r_thread = QtCore.QThread()
+        self.reader = StatusReader()
+        self.reader.moveToThread(self.r_thread)
+        self.r_thread.started.connect(self.reader.run)
+        self.reader.statusReceived.connect(self.handle_status)
+        self.r_thread.start()
 
-    def show_homing_complete_popup(self):
-        print("[GUI] Mostrando pop-up de 'Puesta a 0 completada'")
-        msg_box = QtWidgets.QMessageBox(self)
-        try:
-            icon_pixmap = self.style().standardPixmap(QtWidgets.QStyle.SP_DialogApplyButton)
-            msg_box.setIconPixmap(icon_pixmap.scaled(64, 64))
-        except Exception:
-            msg_box.setIcon(QtWidgets.QMessageBox.Information)
-        msg_box.setWindowTitle("Proceso Finalizado")
-        msg_box.setText("Puesta a 0 completada")
-        msg_box.setStandardButtons(QtWidgets.QMessageBox.Ok)
-        run_dialog(msg_box)
+    # === AQUÍ ESTÁ LA LÓGICA CORREGIDA ===
+    def handle_status(self, s):
+        if not s: return
 
-    def closeEvent(self, event):
-        print("[GUI] Cerrando aplicación, deteniendo hilos...")
-        self.poll_timer.stop()
-        if hasattr(self, 'status_reader'):
-            self.status_reader.stop()
-        if hasattr(self, 'reader_thread'):
-            self.reader_thread.quit()
-            if not self.reader_thread.wait(1000):
-                print("[GUI] Hilo lector no responde, terminando...")
-                self.reader_thread.terminate()
-        event.accept()
+        # Si estamos en el "tiempo de gracia" (el motor arrancando), IGNORAMOS todo
+        if time.time() < self.ignore_status_until:
+            return
+
+        # Estado 500: Homing en proceso
+        if "500" in s:
+            # Si el robot dice que hace homing, le creemos
+            self.is_homing = True
+            self.is_moving_ptp = False
+            self.lbl_status.setText("HOMING...")
+            self.lbl_status.setStyleSheet("color:red")
+            
+        # Estado 501: IDLE / Terminado
+        elif "501" in s:
+            if self.is_homing:
+                self.is_homing = False
+                self.lbl_status.setText("IDLE")
+                self.lbl_status.setStyleSheet("color:green")
+                self.show_custom_popup("Información", "Homing OK")
+                
+            elif self.is_moving_ptp:
+                self.is_moving_ptp = False
+                self.lbl_status.setText("IDLE")
+                self.lbl_status.setStyleSheet("color:green")
+                # Cartel correcto para PTP
+                self.show_custom_popup("Éxito", "Movimiento al punto realizado correctamente")
+
+    # Función auxiliar para mostrar mensaje con Check Verde
+    def show_custom_popup(self, title, text):
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setText(text)
+        
+        # Truco: Usamos el icono de "Apply/Aceptar" del sistema que suele ser un Check Verde
+        icon = self.style().standardIcon(QtWidgets.QStyle.SP_DialogApplyButton)
+        msg.setIconPixmap(icon.pixmap(48, 48))
+        
+        msg.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        msg.exec_()
+
+    def closeEvent(self, e):
+        self.close_fifo()
+        if hasattr(self, 'reader'): self.reader.stop()
+        e.accept()
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    app.setStyle("Fusion")
-    try:
-        if hasattr(QtGui, "QGuiApplication") and hasattr(QtCore.Qt, "HighDpiScaleFactorRoundingPolicy"):
-            QtGui.QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
-                QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-            )
-    except Exception:
-        pass
     win = RobotUI()
+    win.show()
     sys.exit(app.exec_())
 
 if __name__ == "__main__":
