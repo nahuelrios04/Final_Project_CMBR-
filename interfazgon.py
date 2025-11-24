@@ -29,18 +29,13 @@ def run_dialog(dlg: QtWidgets.QDialog) -> int:
 # ==== CONFIGURACIÓN DE PASOS ====
 # ==========================================
 
-# CALIBRACIÓN BASADA EN TUS LOGS (1/8 microsteps, 16:1 reducción)
-# 5688 pasos / 80 grados = 71.11 pasos por grado.
 CALIBRACION_PASOS_GRADO = 71.11
-
-# Ángulo para los puntos de prueba P1 y P2
-ANGULO_PRUEBA = 80.0  # <--- MODIFICADO A 80 SEGÚN TU PRUEBA ANTERIOR
+ANGULO_PRUEBA = 80.0 
 
 PASOS_POR_GRADO_1 = CALIBRACION_PASOS_GRADO
 PASOS_POR_GRADO_2 = CALIBRACION_PASOS_GRADO
 PASOS_POR_GRADO_3 = CALIBRACION_PASOS_GRADO
 
-# Cálculo de pasos para el ángulo deseado
 STEPS_OBJETIVO = ANGULO_PRUEBA * CALIBRACION_PASOS_GRADO
 
 # ==== CONFIGURACIÓN CINEMÁTICA ====
@@ -48,24 +43,23 @@ L_BASE_OFFSET = 200.0
 L_BRAZO = 250.0
 L_ANTEBRAZO = 250.0
 
-# Límites Ángulos (Grados)
 LIM_EJE1 = (-180, 180)
 LIM_EJE2 = (-90 ,  90)
 LIM_EJE3 = (-90 ,  90)
 
-# --- PUNTOS PREDEFINIDOS ---
 PRESET_POINTS = [
     [STEPS_OBJETIVO,  STEPS_OBJETIVO,  STEPS_OBJETIVO, f"P1 (Todos a +{ANGULO_PRUEBA:.0f} grados)"],
     [-STEPS_OBJETIVO, -STEPS_OBJETIVO, -STEPS_OBJETIVO, f"P2 (Todos a -{ANGULO_PRUEBA:.0f} grados)"],
-    [300,   0, 300, "Punto Seguro (Inicio)"],
-    [350,   0, 400, "Punto Alto (Límite)"],
-    [400,   0, 200, "Punto Bajo (Recogida)"],
-    [300, 200, 250, "Punto Lateral 1"],
-    [200, 150, 300, "Punto Cercano"],
-    [350, -100, 250, "Punto Intermedio"],
-    [480,   0, 250, "Extensión Máxima"],
-    [100, 300, 300, "Punto Izquierda"],
-    [250,   0, 350, "Punto Retraído Arriba"],
+    [STEPS_OBJETIVO/2, STEPS_OBJETIVO/2  , STEPS_OBJETIVO/2, "P3 (Mitad de recorrido)"],
+    [-STEPS_OBJETIVO/2,   -STEPS_OBJETIVO/2, -STEPS_OBJETIVO/2, "P4 (Mitad negativo)"],
+    [STEPS_OBJETIVO/4,   STEPS_OBJETIVO/4, STEPS_OBJETIVO/4, "P5 (Cuarto de recorrido)"],
+    [-STEPS_OBJETIVO/4,   -STEPS_OBJETIVO/4, -STEPS_OBJETIVO/4, "P6 (Cuarto negativo)"],
+    [300, 200, 250, "Punto Lateral 1 (XYZ)"],
+    [200, 150, 300, "Punto Cercano (XYZ)"],
+    [350, -100, 250, "Punto Intermedio (XYZ)"],
+    [480,   0, 250, "Extensión Máxima (XYZ)"],
+    [100, 300, 300, "Punto Izquierda (XYZ)"],
+    [250,   0, 350, "Punto Retraído Arriba (XYZ)"],
 ]
 
 def compute_units(widget=None):
@@ -91,13 +85,8 @@ def compute_units(widget=None):
 # ==== KINEMATICS ====
 class Kinematics:
     def __init__(self): 
-        # === CAMBIO IMPORTANTE: INICIO EN CERO ABSOLUTO ===
-        # Asumimos que al encender el robot está en posición de reposo (0,0,0)
         self.theta1, self.theta2, self.theta3 = 0.0, 0.0, 0.0
-        
-        # Calculamos dónde está la punta (XYZ) basándonos en los ángulos 0,0,0
         self.curr_x, self.curr_y, self.curr_z = self.forward_kinematics_xyz(0.0, 0.0, 0.0)
-        
         print(f"Inicio Software: Angulos=(0,0,0) -> Pos XYZ=({self.curr_x:.0f}, {self.curr_y:.0f}, {self.curr_z:.0f})")
 
     def forward_kinematics_xyz(self, d1, d2, d3):
@@ -114,11 +103,8 @@ class Kinematics:
         z_prime = tz - L_BASE_OFFSET
         D = math.sqrt(r**2 + z_prime**2)
 
-        if D > (L_BRAZO + L_ANTEBRAZO):
-            # print(f"[IK ERROR] Punto fuera de alcance")
-            return None
-        if D < abs(L_BRAZO - L_ANTEBRAZO):
-            return None
+        if D > (L_BRAZO + L_ANTEBRAZO): return None
+        if D < abs(L_BRAZO - L_ANTEBRAZO): return None
 
         numerator = (r**2 + z_prime**2 - L_BRAZO**2 - L_ANTEBRAZO**2)
         denominator = (2 * L_BRAZO * L_ANTEBRAZO)
@@ -248,7 +234,12 @@ class RobotUI(QtWidgets.QMainWindow):
         self.S = compute_units(self)
 
         self.fd_tx = None 
+        # === ESTADOS ===
         self.is_homing = False
+        self.is_moving_ptp = False
+        
+        # Variable para evitar el cartel inmediato
+        self.ignore_status_until = 0.0
 
         # UI
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
@@ -302,7 +293,7 @@ class RobotUI(QtWidgets.QMainWindow):
         self.poll_timer.timeout.connect(self.poll_status)
         self.poll_timer.start(1000)
 
-    # --- CONEXIÓN FIFO ROBUSTA ---
+    # --- CONEXIÓN FIFO ---
     def connect_fifo(self):
         if self.fd_tx is not None: return
         if not os.path.exists(FIFO_PATH): return
@@ -331,10 +322,10 @@ class RobotUI(QtWidgets.QMainWindow):
             if e.errno == errno.EPIPE: self.close_fifo()
             elif e.errno != errno.EAGAIN: self.log_cmd(f"Err TX: {e}"); self.close_fifo()
 
-    # -------------------------------------------
+    # --- MOVIMIENTOS ---
 
     def move_joint(self, axis, delta):
-        if self.is_homing: return
+        if self.is_homing or self.is_moving_ptp: return
         a1, a2, a3 = robot.theta1, robot.theta2, robot.theta3
 
         if axis == 1: a1 += delta
@@ -355,43 +346,50 @@ class RobotUI(QtWidgets.QMainWindow):
             self.log_cmd("Límite alcanzado")
 
     def _open_preset_dialog(self):
-        if self.is_homing: return
+        if self.is_homing or self.is_moving_ptp: return
         dlg = PresetMoveDialog(self)
         if run_dialog(dlg) == QtWidgets.QDialog.Accepted:
             idx = dlg.get_selected_point_index()
             px, py, pz, name = PRESET_POINTS[idx]
+            
+            targets_pasos = ["P1", "P2", "P3", "P4", "P5", "P6"]
+            
+            # --- LIMPIEZA DE BANDERAS Y SETEO DE ESTADO ---
+            self.is_homing = False          # Nos aseguramos que NO es homing
+            self.is_moving_ptp = True       # Activamos PTP
+            
+            # MAGIA: Ignorar reportes de estado por 1.5 segundos para que arranque
+            self.ignore_status_until = time.time() + 1.5
+            
+            self.lbl_status.setText("MOVIENDO...")
+            self.lbl_status.setStyleSheet("color: orange")
 
-            # === LÓGICA ESPECIAL P1 / P2 (Pasos Directos) ===
-            if "P1" in name or "P2" in name:
-                self.log_cmd(f"PTP Directo: {name}")
-
-                # Convertimos Pasos a Grados para el modelo interno
+            if any(t in name for t in targets_pasos):
+                self.log_cmd(f"PTP Directo (Steps->Deg): {name}")
                 t1 = px / PASOS_POR_GRADO_1
                 t2 = py / PASOS_POR_GRADO_2
                 t3 = pz / PASOS_POR_GRADO_3
-
                 robot.theta1, robot.theta2, robot.theta3 = t1, t2, t3
                 robot.curr_x, robot.curr_y, robot.curr_z = robot.forward_kinematics_xyz(t1, t2, t3)
-
                 self.update_labels()
                 self.send_kinematic_move(t1, t2, t3)
-
-            # === LÓGICA NORMAL (Coordenadas XYZ) ===
             else:
-                self.log_cmd(f"PTP Objetivo: {name}")
+                self.log_cmd(f"PTP Objetivo (XYZ mm): {name}")
                 ok, angs = robot.update_target(px, py, pz)
                 if ok:
                     self.update_labels()
                     self.send_kinematic_move(*angs)
                 else:
                     self.log_cmd("Error: Punto fuera de rango")
+                    self.is_moving_ptp = False
+                    self.lbl_status.setText("IDLE")
+                    self.lbl_status.setStyleSheet("color:green")
 
     def update_labels(self):
         self.lbl_xyz.setText(f"X:{robot.curr_x:.0f} Y:{robot.curr_y:.0f} Z:{robot.curr_z:.0f}")
         self.lbl_ang.setText(f"A1:{robot.theta1:.1f} A2:{robot.theta2:.1f} A3:{robot.theta3:.1f}")
 
     def send_kinematic_move(self, a1, a2, a3):
-        # Calculamos la diferencia desde el último punto
         delta_a1 = a1 - self.last_a1
         delta_a2 = a2 - self.last_a2
         delta_a3 = a3 - self.last_a3
@@ -401,18 +399,27 @@ class RobotUI(QtWidgets.QMainWindow):
         s3 = int(delta_a3 * PASOS_POR_GRADO_3)
 
         self.log_cmd(f"Mov: {delta_a1:.1f}/{delta_a2:.1f}/{delta_a3:.1f} gr -> {s1}/{s2}/{s3} steps")
-
         self.last_a1, self.last_a2, self.last_a3 = a1, a2, a3
 
-        if s1==0 and s2==0 and s3==0: return
+        if s1==0 and s2==0 and s3==0: 
+            self.is_moving_ptp = False
+            self.lbl_status.setText("IDLE")
+            self.lbl_status.setStyleSheet("color:green")
+            return
 
         self.send_spi(400, s1, s2)
         time.sleep(0.002)
         self.send_spi(401, s3, 0)
 
     def do_home(self):
+        # Limpiamos estados
+        self.is_moving_ptp = False
+        self.is_homing = True 
+        
+        # También damos un tiempito de gracia para el Home
+        self.ignore_status_until = time.time() + 1.0
+        
         self.send_spi(500, 0, 0)
-        # Al hacer HOME, reseteamos las coordenadas internas a 0,0,0
         self.last_a1, self.last_a2, self.last_a3 = 0.0, 0.0, 0.0
         robot.theta1, robot.theta2, robot.theta3 = 0.0, 0.0, 0.0
         robot.curr_x, robot.curr_y, robot.curr_z = robot.forward_kinematics_xyz(0,0,0)
@@ -436,18 +443,49 @@ class RobotUI(QtWidgets.QMainWindow):
         self.reader.statusReceived.connect(self.handle_status)
         self.r_thread.start()
 
+    # === AQUÍ ESTÁ LA LÓGICA CORREGIDA ===
     def handle_status(self, s):
         if not s: return
+
+        # Si estamos en el "tiempo de gracia" (el motor arrancando), IGNORAMOS todo
+        if time.time() < self.ignore_status_until:
+            return
+
+        # Estado 500: Homing en proceso
         if "500" in s:
+            # Si el robot dice que hace homing, le creemos
             self.is_homing = True
+            self.is_moving_ptp = False
             self.lbl_status.setText("HOMING...")
             self.lbl_status.setStyleSheet("color:red")
+            
+        # Estado 501: IDLE / Terminado
         elif "501" in s:
             if self.is_homing:
                 self.is_homing = False
                 self.lbl_status.setText("IDLE")
                 self.lbl_status.setStyleSheet("color:green")
-                QtWidgets.QMessageBox.information(self, "Info", "Homing OK")
+                self.show_custom_popup("Información", "Homing OK")
+                
+            elif self.is_moving_ptp:
+                self.is_moving_ptp = False
+                self.lbl_status.setText("IDLE")
+                self.lbl_status.setStyleSheet("color:green")
+                # Cartel correcto para PTP
+                self.show_custom_popup("Éxito", "Movimiento al punto realizado correctamente")
+
+    # Función auxiliar para mostrar mensaje con Check Verde
+    def show_custom_popup(self, title, text):
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setText(text)
+        
+        # Truco: Usamos el icono de "Apply/Aceptar" del sistema que suele ser un Check Verde
+        icon = self.style().standardIcon(QtWidgets.QStyle.SP_DialogApplyButton)
+        msg.setIconPixmap(icon.pixmap(48, 48))
+        
+        msg.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        msg.exec_()
 
     def closeEvent(self, e):
         self.close_fifo()
