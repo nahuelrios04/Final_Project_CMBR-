@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import sys
 import os
 import time
@@ -24,29 +25,38 @@ FIFO_RX_PATH = "/tmp/spi_rx"
 def run_dialog(dlg: QtWidgets.QDialog) -> int:
     return dlg.exec() if hasattr(dlg, "exec") else dlg.exec_()
 
-# ==== CONFIGURACIÓN DEL ROBOT ====
+# ==========================================
+# ==== CONFIGURACIÓN DE PASOS ====
+# ==========================================
+
+# CALIBRACIÓN BASADA EN TUS LOGS (1/8 microsteps, 16:1 reducción)
+# 5688 pasos / 80 grados = 71.11 pasos por grado.
+CALIBRACION_PASOS_GRADO = 71.11
+
+# Ángulo para los puntos de prueba P1 y P2
+ANGULO_PRUEBA = 80.0  # <--- MODIFICADO A 80 SEGÚN TU PRUEBA ANTERIOR
+
+PASOS_POR_GRADO_1 = CALIBRACION_PASOS_GRADO
+PASOS_POR_GRADO_2 = CALIBRACION_PASOS_GRADO
+PASOS_POR_GRADO_3 = CALIBRACION_PASOS_GRADO
+
+# Cálculo de pasos para el ángulo deseado
+STEPS_OBJETIVO = ANGULO_PRUEBA * CALIBRACION_PASOS_GRADO
+
+# ==== CONFIGURACIÓN CINEMÁTICA ====
 L_BASE_OFFSET = 200.0
 L_BRAZO = 250.0
 L_ANTEBRAZO = 250.0
 
-# Límites Ángulos (Grados) - Relajados para alcanzar puntos
+# Límites Ángulos (Grados)
 LIM_EJE1 = (-180, 180)
 LIM_EJE2 = (-90 ,  90)
 LIM_EJE3 = (-90 ,  90)
 
-# --- HARDWARE (1:16, 8 microsteps) ---
-# Total pasos por vuelta = 25,600
-# Ratio: ~71.11 pasos por grado
-PASOS_POR_GRADO_1 = (200 * 8 * 16) / 360.0
-PASOS_POR_GRADO_2 = (200 * 8 * 16) / 360.0
-PASOS_POR_GRADO_3 = (200 * 8 * 16) / 360.0
-
 # --- PUNTOS PREDEFINIDOS ---
-# P1 y P2 son PASOS ABSOLUTOS (Target Steps) respecto a HOME 0.
-# El resto son coordenadas XYZ en mm.
 PRESET_POINTS = [
-    [2133,  2133,  2133, "P1 (Positivo / +30 grados)"],
-    [-2133, -2133, -2133, "P2 (Negativo / -30 grados)"],
+    [STEPS_OBJETIVO,  STEPS_OBJETIVO,  STEPS_OBJETIVO, f"P1 (Todos a +{ANGULO_PRUEBA:.0f} grados)"],
+    [-STEPS_OBJETIVO, -STEPS_OBJETIVO, -STEPS_OBJETIVO, f"P2 (Todos a -{ANGULO_PRUEBA:.0f} grados)"],
     [300,   0, 300, "Punto Seguro (Inicio)"],
     [350,   0, 400, "Punto Alto (Límite)"],
     [400,   0, 200, "Punto Bajo (Recogida)"],
@@ -80,14 +90,15 @@ def compute_units(widget=None):
 
 # ==== KINEMATICS ====
 class Kinematics:
-    def _init_(self):
-        x_start, y_start, z_start = 400.0, 0.0, L_BASE_OFFSET + 100.0
-        self.curr_x, self.curr_y, self.curr_z = x_start, y_start, z_start
-        self.theta1, self.theta2, self.theta3 = 0, 0, 0
-        ok, angles = self.update_target(x_start, y_start, z_start)
-        if not ok:
-            self.theta1, self.theta2, self.theta3 = 0.0, 90.0, -90.0
-            self.curr_x, self.curr_y, self.curr_z = 0.0, 0.0, L_BASE_OFFSET + L_ANTEBRAZO
+    def __init__(self): 
+        # === CAMBIO IMPORTANTE: INICIO EN CERO ABSOLUTO ===
+        # Asumimos que al encender el robot está en posición de reposo (0,0,0)
+        self.theta1, self.theta2, self.theta3 = 0.0, 0.0, 0.0
+        
+        # Calculamos dónde está la punta (XYZ) basándonos en los ángulos 0,0,0
+        self.curr_x, self.curr_y, self.curr_z = self.forward_kinematics_xyz(0.0, 0.0, 0.0)
+        
+        print(f"Inicio Software: Angulos=(0,0,0) -> Pos XYZ=({self.curr_x:.0f}, {self.curr_y:.0f}, {self.curr_z:.0f})")
 
     def forward_kinematics_xyz(self, d1, d2, d3):
         t1 = math.radians(d1); t2 = math.radians(d2); t3 = math.radians(d3)
@@ -99,38 +110,40 @@ class Kinematics:
 
     def calculate_ik(self, tx, ty, tz):
         t1_rad = math.atan2(ty, tx)
-        r = math.sqrt(tx*2 + ty*2)
+        r = math.sqrt(tx**2 + ty**2)
         z_prime = tz - L_BASE_OFFSET
-        D = math.sqrt(r*2 + z_prime*2)
+        D = math.sqrt(r**2 + z_prime**2)
 
         if D > (L_BRAZO + L_ANTEBRAZO):
-            print(f"[IK ERROR] Punto fuera de alcance: Distancia {D:.1f} > Max {L_BRAZO+L_ANTEBRAZO}")
+            # print(f"[IK ERROR] Punto fuera de alcance")
             return None
         if D < abs(L_BRAZO - L_ANTEBRAZO):
-            print("[IK ERROR] Punto demasiado cerca del eje")
             return None
 
-        cos_t3 = (r*2 + z_prime2 - L_BRAZO2 - L_ANTEBRAZO*2) / (2 * L_BRAZO * L_ANTEBRAZO)
+        numerator = (r**2 + z_prime**2 - L_BRAZO**2 - L_ANTEBRAZO**2)
+        denominator = (2 * L_BRAZO * L_ANTEBRAZO)
+        if denominator == 0: return None
+        
+        cos_t3 = numerator / denominator
         cos_t3 = max(-1.0, min(1.0, cos_t3))
         t3_rad = math.acos(cos_t3)
 
         alpha = math.atan2(z_prime, r)
-        beta = math.acos((r*2 + z_prime2 + L_BRAZO2 - L_ANTEBRAZO*2) / (2 * D * L_BRAZO))
+        beta_num = (r**2 + z_prime**2 + L_BRAZO**2 - L_ANTEBRAZO**2)
+        beta_den = (2 * D * L_BRAZO)
+        if beta_den == 0: return None
+        
+        beta_val = max(-1.0, min(1.0, beta_num / beta_den))
+        beta = math.acos(beta_val)
         t2_rad = alpha + beta
 
         d1 = math.degrees(t1_rad)
         d2 = math.degrees(t2_rad)
         d3 = -math.degrees(t3_rad)
 
-        if not (LIM_EJE1[0] <= d1 <= LIM_EJE1[1]):
-            print(f"[IK ERROR] Eje 1 fuera de limite: {d1:.1f}°")
-            return None
-        if not (LIM_EJE2[0] <= d2 <= LIM_EJE2[1]):
-            print(f"[IK ERROR] Eje 2 fuera de limite: {d2:.1f}°")
-            return None
-        if not (LIM_EJE3[0] <= d3 <= LIM_EJE3[1]):
-            print(f"[IK ERROR] Eje 3 fuera de limite: {d3:.1f}°")
-            return None
+        if not (LIM_EJE1[0] <= d1 <= LIM_EJE1[1]): return None
+        if not (LIM_EJE2[0] <= d2 <= LIM_EJE2[1]): return None
+        if not (LIM_EJE3[0] <= d3 <= LIM_EJE3[1]): return None
 
         return (d1, d2, d3)
 
@@ -149,8 +162,8 @@ robot = Kinematics()
 # -----------------------------------------------------------------
 class StatusReader(QtCore.QObject):
     statusReceived = QtCore.pyqtSignal(str)
-    def _init_(self):
-        super()._init_()
+    def __init__(self):
+        super().__init__()
         self.is_running = True
     def run(self):
         while self.is_running:
@@ -167,8 +180,8 @@ class StatusReader(QtCore.QObject):
 
 # ==== DIÁLOGOS ====
 class ManualDialog(QtWidgets.QDialog):
-    def _init_(self, parent=None, sender_callback=None):
-        super()._init_(parent)
+    def __init__(self, parent=None, sender_callback=None):
+        super().__init__(parent)
         self.setWindowTitle("Modo Manual")
         self.sender = sender_callback
         S = compute_units(self)
@@ -205,15 +218,20 @@ class ManualDialog(QtWidgets.QDialog):
         if self.sender: self.sender(base, d, 0)
 
 class PresetMoveDialog(QtWidgets.QDialog):
-    def _init_(self, parent=None, sender_callback=None):
-        super()._init_(parent)
+    def __init__(self, parent=None, sender_callback=None):
+        super().__init__(parent)
         self.setWindowTitle("Mover a Punto Predefinido")
-        self.resize(300, 150)
+        self.resize(350, 200)
         lay = QtWidgets.QVBoxLayout(self)
+        
+        info = QtWidgets.QLabel(f"Ratio Actual: {CALIBRACION_PASOS_GRADO:.2f} pasos/grado")
+        info.setStyleSheet("color: blue; font-weight: bold;")
+        lay.addWidget(info)
+
         lay.addWidget(QtWidgets.QLabel("Selecciona un punto objetivo:"))
         self.combo_points = QtWidgets.QComboBox()
         for pt in PRESET_POINTS:
-            self.combo_points.addItem(f"{pt[3]} ({pt[0]}, {pt[1]}, {pt[2]})")
+            self.combo_points.addItem(f"{pt[3]}")
         lay.addWidget(self.combo_points)
         btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
@@ -224,8 +242,8 @@ class PresetMoveDialog(QtWidgets.QDialog):
 
 # ==== VENTANA PRINCIPAL ====
 class RobotUI(QtWidgets.QMainWindow):
-    def _init_(self):
-        super()._init_()
+    def __init__(self):
+        super().__init__()
         self.setWindowTitle("Control Robot - PTP/MoveJ")
         self.S = compute_units(self)
 
@@ -334,7 +352,7 @@ class RobotUI(QtWidgets.QMainWindow):
             self.update_labels()
             self.send_kinematic_move(*angs)
         else:
-            self.log_cmd("Límite alcanzado (ver terminal)")
+            self.log_cmd("Límite alcanzado")
 
     def _open_preset_dialog(self):
         if self.is_homing: return
@@ -345,8 +363,9 @@ class RobotUI(QtWidgets.QMainWindow):
 
             # === LÓGICA ESPECIAL P1 / P2 (Pasos Directos) ===
             if "P1" in name or "P2" in name:
-                self.log_cmd(f"PTP Directo (Pasos): {name}")
+                self.log_cmd(f"PTP Directo: {name}")
 
+                # Convertimos Pasos a Grados para el modelo interno
                 t1 = px / PASOS_POR_GRADO_1
                 t2 = py / PASOS_POR_GRADO_2
                 t3 = pz / PASOS_POR_GRADO_3
@@ -365,16 +384,23 @@ class RobotUI(QtWidgets.QMainWindow):
                     self.update_labels()
                     self.send_kinematic_move(*angs)
                 else:
-                    self.log_cmd("Error: Punto fuera de rango (ver terminal)")
+                    self.log_cmd("Error: Punto fuera de rango")
 
     def update_labels(self):
         self.lbl_xyz.setText(f"X:{robot.curr_x:.0f} Y:{robot.curr_y:.0f} Z:{robot.curr_z:.0f}")
         self.lbl_ang.setText(f"A1:{robot.theta1:.1f} A2:{robot.theta2:.1f} A3:{robot.theta3:.1f}")
 
     def send_kinematic_move(self, a1, a2, a3):
-        s1 = int((a1 - self.last_a1) * PASOS_POR_GRADO_1)
-        s2 = int((a2 - self.last_a2) * PASOS_POR_GRADO_2)
-        s3 = int((a3 - self.last_a3) * PASOS_POR_GRADO_3)
+        # Calculamos la diferencia desde el último punto
+        delta_a1 = a1 - self.last_a1
+        delta_a2 = a2 - self.last_a2
+        delta_a3 = a3 - self.last_a3
+
+        s1 = int(delta_a1 * PASOS_POR_GRADO_1)
+        s2 = int(delta_a2 * PASOS_POR_GRADO_2)
+        s3 = int(delta_a3 * PASOS_POR_GRADO_3)
+
+        self.log_cmd(f"Mov: {delta_a1:.1f}/{delta_a2:.1f}/{delta_a3:.1f} gr -> {s1}/{s2}/{s3} steps")
 
         self.last_a1, self.last_a2, self.last_a3 = a1, a2, a3
 
@@ -386,8 +412,10 @@ class RobotUI(QtWidgets.QMainWindow):
 
     def do_home(self):
         self.send_spi(500, 0, 0)
-        robot.update_target(400, 0, 300)
-        self.last_a1, self.last_a2, self.last_a3 = robot.theta1, robot.theta2, robot.theta3
+        # Al hacer HOME, reseteamos las coordenadas internas a 0,0,0
+        self.last_a1, self.last_a2, self.last_a3 = 0.0, 0.0, 0.0
+        robot.theta1, robot.theta2, robot.theta3 = 0.0, 0.0, 0.0
+        robot.curr_x, robot.curr_y, robot.curr_z = robot.forward_kinematics_xyz(0,0,0)
         self.update_labels()
 
     def _open_manual_dialog(self):
@@ -397,9 +425,7 @@ class RobotUI(QtWidgets.QMainWindow):
         self.log.appendPlainText(f">> {t}")
         c = self.log.textCursor(); c.movePosition(QtGui.QTextCursor.End); self.log.setTextCursor(c)
 
-    # --- CORRECCIÓN CLAVE DEL BUG DE IDLE ---
     def poll_status(self):
-        # Siempre preguntar, incluso en Homing, para detectar el cambio de 500 -> 501
         self.send_spi(0, 0, 0)
 
     def setup_status_reader_thread(self):
@@ -434,5 +460,5 @@ def main():
     win.show()
     sys.exit(app.exec_())
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
