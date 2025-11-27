@@ -12,10 +12,31 @@
 #include "esp_rom_sys.h"
 #include "driver/spi_slave.h"
 
-static const char *TAG = "ROBOT_V9_1_FIXED";
+static const char *TAG = "ROBOT_V9_1_FINAL";
 
 /* ============================================================
- * CONFIGURACIÓN GLOBAL
+ * --- CONFIGURACIÓN DE SEGURIDAD (HALL ENCODERS) ---
+ * ============================================================ */
+#define PIN_HALL_ENC_E1  16
+#define PIN_HALL_ENC_E2  17
+
+// TIEMPO MÁXIMO PERMITIDO SIN PULSOS (ms)
+// Como en Eje 2 un pulso tarda ~1s a baja velocidad, damos 2.5s de margen.
+#define MAX_STALL_TIME_MS  2500 
+
+static volatile bool g_alarm_triggered = false; 
+static volatile bool g_moving_e1 = false;       
+static volatile bool g_moving_e2 = false;       
+
+static volatile uint32_t g_pulse_count_e1 = 0;
+static volatile uint32_t g_pulse_count_e2 = 0;
+
+// ISR para contar pulsos
+static void IRAM_ATTR isr_enc_e1(void* arg) { g_pulse_count_e1++; }
+static void IRAM_ATTR isr_enc_e2(void* arg) { g_pulse_count_e2++; }
+
+/* ============================================================
+ * CONFIGURACIÓN GLOBAL ORIGINAL
  * ============================================================ */
 #define BIT_EJE1_DONE  (1 << 0)
 #define BIT_EJE2_DONE  (1 << 1)
@@ -142,10 +163,13 @@ static inline void ledc_set_duty_on(ledc_mode_t mode, ledc_channel_t ch, ledc_ti
     ledc_set_duty(mode, ch, duty_on); 
     ledc_update_duty(mode, ch);
 }
-static inline void eje1_pwm_start(void) { ledc_set_duty_on(LEDC_MODE_1, LEDC_CH_1, LEDC_RES_1); }
-static inline void eje1_pwm_stop(void)  { ledc_stop(LEDC_MODE_1, LEDC_CH_1, 0); esp_rom_delay_us(100); }
-static inline void eje2_pwm_start() { ledc_set_duty_on(LEDC_MODE_2, LEDC_CH_2, LEDC_RES_2); }
-static inline void eje2_pwm_stop()  { ledc_stop(LEDC_MODE_2, LEDC_CH_2, 0); esp_rom_delay_us(100); }
+
+static inline void eje1_pwm_start(void) { g_moving_e1 = true; ledc_set_duty_on(LEDC_MODE_1, LEDC_CH_1, LEDC_RES_1); }
+static inline void eje1_pwm_stop(void)  { ledc_stop(LEDC_MODE_1, LEDC_CH_1, 0); g_moving_e1 = false; esp_rom_delay_us(100); }
+
+static inline void eje2_pwm_start() { g_moving_e2 = true; ledc_set_duty_on(LEDC_MODE_2, LEDC_CH_2, LEDC_RES_2); }
+static inline void eje2_pwm_stop()  { ledc_stop(LEDC_MODE_2, LEDC_CH_2, 0); g_moving_e2 = false; esp_rom_delay_us(100); }
+
 static inline void eje3_pwm_start() { ledc_set_duty_on(LEDC_MODE_3, LEDC_CH_3, LEDC_RES_3); }
 static inline void eje3_pwm_stop()  { ledc_stop(LEDC_MODE_3, LEDC_CH_3, 0); esp_rom_delay_us(100); }
 
@@ -197,6 +221,11 @@ static void eje3_ramp_freq(float fi, float ff, uint32_t ms) {
 // Reconfiguraciones
 static void reconfigure_step_to_ledc(int pin_step, ledc_channel_t channel, ledc_timer_t timer, ledc_mode_t mode, ledc_timer_bit_t res, float freq_hz) {
     gpio_set_direction(pin_step, GPIO_MODE_OUTPUT);
+    
+    // IMPORTANTE: Aseguramos flags a false al reconfigurar
+    if(channel == LEDC_CH_1) g_moving_e1 = false;
+    if(channel == LEDC_CH_2) g_moving_e2 = false;
+
     ledc_stop(mode, channel, 0); 
     ledc_timer_config_t timer_cfg = { .speed_mode = mode, .duty_resolution = res, .timer_num = timer, .freq_hz = (uint32_t)freq_hz, .clk_cfg = LEDC_AUTO_CLK };
     ledc_timer_config(&timer_cfg);
@@ -205,8 +234,8 @@ static void reconfigure_step_to_ledc(int pin_step, ledc_channel_t channel, ledc_
 }
 static void reconfigure_step_to_gpio(int pin_step) {
     switch(pin_step) {
-        case PIN_TB6560_STEP: ledc_stop(LEDC_MODE_1, LEDC_CH_1, 0); break;
-        case PIN_STEP_2: ledc_stop(LEDC_MODE_2, LEDC_CH_2, 0); break;
+        case PIN_TB6560_STEP: ledc_stop(LEDC_MODE_1, LEDC_CH_1, 0); g_moving_e1 = false; break;
+        case PIN_STEP_2: ledc_stop(LEDC_MODE_2, LEDC_CH_2, 0); g_moving_e2 = false; break;
         case PIN_STEP_3: ledc_stop(LEDC_MODE_3, LEDC_CH_3, 0); break;
     }
     gpio_set_direction(pin_step, GPIO_MODE_OUTPUT); gpio_set_level(pin_step, 0); 
@@ -214,7 +243,7 @@ static void reconfigure_step_to_gpio(int pin_step) {
 
 
 /* ============================================================
- * HOMING EJE 1 (Lógica Original 2-Pass)
+ * HOMING EJE 1
  * ============================================================ */
 static void eje1_pass1_seek_cw(void) {
     if (check_sensor(PIN_HALL_1)) {
@@ -264,26 +293,26 @@ static void homing_eje1_logic(void) {
 }
 
 /* ============================================================
- * HOMING EJE 2/3 (Lógica Original Compleja con Sobrepaso)
+ * HOMING EJE 2/3
  * ============================================================ */
 typedef enum { SOBREPASO_OK=0, SOBREPASO_ENDSTOP=1 } sobrepaso_res_t;
 
 // --- EJE 2 ---
 static sobrepaso_res_t eje2_verificar_sobrepaso(void) {
-    eje2_set_freq(FREQ_VERIFICACION_HZ_23); eje2_pwm_start(); // Corrección constante
+    eje2_set_freq(FREQ_VERIFICACION_HZ_23); eje2_pwm_start();
     if(check_sensor(PIN_HALL_2)) eje2_wait_hall_high();
     int64_t t0 = esp_timer_get_time(); int cl=0;
     while(1) {
         if(check_sensor(PIN_HALL_2)){ 
             if(++cl>=HALL_DEBOUNCE_N){ eje2_pwm_stop(); return SOBREPASO_ENDSTOP; } 
         } else cl=0;
-        if(((esp_timer_get_time()-t0)/1000) >= TIEMPO_SOBREPASO_MS_23) { eje2_pwm_stop(); return SOBREPASO_OK; } // Corrección
+        if(((esp_timer_get_time()-t0)/1000) >= TIEMPO_SOBREPASO_MS_23) { eje2_pwm_stop(); return SOBREPASO_OK; } 
         vTaskDelay(1);
     }
 }
 static void eje2_escape_endstop(int *d) {
     gpio_set_level(PIN_LED_2, 1); *d = (*d==DIR_CW_2)?DIR_CCW_2:DIR_CW_2;
-    eje2_set_dir(*d); eje2_set_freq(FREQ_BUSQUEDA_HZ_23); eje2_pwm_start(); // Corrección
+    eje2_set_dir(*d); eje2_set_freq(FREQ_BUSQUEDA_HZ_23); eje2_pwm_start(); 
     eje2_wait_hall_high(); eje2_wait_hall_low(); eje2_wait_hall_high();
     eje2_pwm_stop(); gpio_set_level(PIN_LED_2, 0);
 }
@@ -297,21 +326,21 @@ static bool eje2_start_on_hall(int *d) {
     return true;
 }
 static bool eje2_confirm(int *d) {
-    eje2_ramp_freq(FREQ_BUSQUEDA_HZ_23, FREQ_VERIFICACION_HZ_23, TIEMPO_RAMPA_MS_23); // Corrección
+    eje2_ramp_freq(FREQ_BUSQUEDA_HZ_23, FREQ_VERIFICACION_HZ_23, TIEMPO_RAMPA_MS_23); 
     if(eje2_verificar_sobrepaso()==SOBREPASO_ENDSTOP){ eje2_escape_endstop(d); return false; }
     *d = (*d==DIR_CW_2)?DIR_CCW_2:DIR_CW_2; eje2_set_dir(*d);
-    eje2_set_freq(FREQ_VERIFICACION_HZ_23); eje2_pwm_start(); eje2_wait_hall_low(); eje2_pwm_stop(); // Corrección
+    eje2_set_freq(FREQ_VERIFICACION_HZ_23); eje2_pwm_start(); eje2_wait_hall_low(); eje2_pwm_stop(); 
     return true;
 }
 static void homing_eje2_logic(void) {
     reconfigure_step_to_ledc(PIN_STEP_2, LEDC_CH_2, LEDC_TIMER_1_ID, LEDC_MODE_2, LEDC_RES_2, FREQ_BUSQUEDA_HZ_23);
     int d = DIR_CW_2; eje2_set_dir(d);
     if(check_sensor(PIN_HALL_2)) { if(eje2_start_on_hall(&d)) return; }
-    eje2_set_freq(FREQ_BUSQUEDA_HZ_23); eje2_pwm_start(); // Corrección
+    eje2_set_freq(FREQ_BUSQUEDA_HZ_23); eje2_pwm_start(); 
     while(1) {
         eje2_wait_hall_low(); eje2_pwm_stop();
         if(eje2_confirm(&d)) break;
-        eje2_set_freq(FREQ_BUSQUEDA_HZ_23); eje2_pwm_start(); // Corrección
+        eje2_set_freq(FREQ_BUSQUEDA_HZ_23); eje2_pwm_start(); 
     }
     eje2_pwm_stop();
     ESP_LOGI(TAG, "Homing E2 OK");
@@ -319,20 +348,20 @@ static void homing_eje2_logic(void) {
 
 // --- EJE 3 ---
 static sobrepaso_res_t eje3_verificar_sobrepaso(void) {
-    eje3_set_freq(FREQ_VERIFICACION_HZ_23); eje3_pwm_start(); // Corrección
+    eje3_set_freq(FREQ_VERIFICACION_HZ_23); eje3_pwm_start(); 
     if(check_sensor(PIN_HALL_3)) eje3_wait_hall_high();
     int64_t t0 = esp_timer_get_time(); int cl=0;
     while(1) {
         if(check_sensor(PIN_HALL_3)){ 
             if(++cl>=HALL_DEBOUNCE_N){ eje3_pwm_stop(); return SOBREPASO_ENDSTOP; } 
         } else cl=0;
-        if(((esp_timer_get_time()-t0)/1000) >= TIEMPO_SOBREPASO_MS_23) { eje3_pwm_stop(); return SOBREPASO_OK; } // Corrección
+        if(((esp_timer_get_time()-t0)/1000) >= TIEMPO_SOBREPASO_MS_23) { eje3_pwm_stop(); return SOBREPASO_OK; } 
         vTaskDelay(1);
     }
 }
 static void eje3_escape_endstop(int *d) {
     gpio_set_level(PIN_LED_3, 1); *d = (*d==DIR_CW_3)?DIR_CCW_3:DIR_CW_3;
-    eje3_set_dir(*d); eje3_set_freq(FREQ_BUSQUEDA_HZ_23); eje3_pwm_start(); // Corrección
+    eje3_set_dir(*d); eje3_set_freq(FREQ_BUSQUEDA_HZ_23); eje3_pwm_start(); 
     eje3_wait_hall_high(); eje3_wait_hall_low(); eje3_wait_hall_high();
     eje3_pwm_stop(); gpio_set_level(PIN_LED_3, 0);
 }
@@ -346,22 +375,22 @@ static bool eje3_start_on_hall(int *d) {
     return true;
 }
 static bool eje3_confirm(int *d) {
-    eje3_ramp_freq(FREQ_BUSQUEDA_HZ_23, FREQ_VERIFICACION_HZ_23, TIEMPO_RAMPA_MS_23); // Corrección
+    eje3_ramp_freq(FREQ_BUSQUEDA_HZ_23, FREQ_VERIFICACION_HZ_23, TIEMPO_RAMPA_MS_23); 
     if(eje3_verificar_sobrepaso()==SOBREPASO_ENDSTOP){ eje3_escape_endstop(d); return false; }
     *d = (*d==DIR_CW_3)?DIR_CCW_3:DIR_CW_3; eje3_set_dir(*d);
-    eje3_set_freq(FREQ_VERIFICACION_HZ_23); eje3_pwm_start(); eje3_wait_hall_low(); eje3_pwm_stop(); // Corrección
+    eje3_set_freq(FREQ_VERIFICACION_HZ_23); eje3_pwm_start(); eje3_wait_hall_low(); eje3_pwm_stop(); 
     return true;
 }
 static void homing_eje3_logic(void) {
     ESP_LOGI(TAG, "Home E3");
-    reconfigure_step_to_ledc(PIN_STEP_3, LEDC_CH_3, LEDC_TIMER_2_ID, LEDC_MODE_3, LEDC_RES_3, FREQ_BUSQUEDA_HZ_23); // Corrección
+    reconfigure_step_to_ledc(PIN_STEP_3, LEDC_CH_3, LEDC_TIMER_2_ID, LEDC_MODE_3, LEDC_RES_3, FREQ_BUSQUEDA_HZ_23); 
     int d = DIR_CW_3; eje3_set_dir(d);
     if(check_sensor(PIN_HALL_3)) { if(eje3_start_on_hall(&d)) goto done; }
-    eje3_set_freq(FREQ_BUSQUEDA_HZ_23); eje3_pwm_start(); // Corrección
+    eje3_set_freq(FREQ_BUSQUEDA_HZ_23); eje3_pwm_start(); 
     while(1) {
         eje3_wait_hall_low(); eje3_pwm_stop();
         if(eje3_confirm(&d)) break;
-        eje3_set_freq(FREQ_BUSQUEDA_HZ_23); eje3_pwm_start(); // Corrección
+        eje3_set_freq(FREQ_BUSQUEDA_HZ_23); eje3_pwm_start(); 
     }
     eje3_pwm_stop();
 done:
@@ -398,15 +427,30 @@ static void move_with_ramp(int pin_step, int pin_dir, int steps, bool dir_high_c
     uint32_t d_curr = d_start;
 
     for(int i=1; i<=total; i++) {
+        if (g_alarm_triggered) break;
+        
         step_once(pin_step, d_curr);
         if(i <= racel) { if (d_curr > d_target) d_curr -= (uint32_t)d_dec; } 
         else if(i > (total - racel)) { d_curr += (uint32_t)d_dec; }
     }
 }
 
-static void w_e1(void *arg) { move_with_ramp(PIN_TB6560_STEP, PIN_TB6560_DIR, target_steps_1, true, "E1"); xEventGroupSetBits(robot_event_group, BIT_EJE1_DONE); vTaskDelete(NULL); }
-static void w_e2(void *arg) { move_with_ramp(PIN_STEP_2, PIN_DIR_2, target_steps_2, true, "E2"); xEventGroupSetBits(robot_event_group, BIT_EJE2_DONE); vTaskDelete(NULL); }
-static void w_e3(void *arg) { move_with_ramp(PIN_STEP_3, PIN_DIR_3, target_steps_3, false, "E3"); xEventGroupSetBits(robot_event_group, BIT_EJE3_DONE); vTaskDelete(NULL); }
+static void w_e1(void *arg) { 
+    g_moving_e1 = true; 
+    move_with_ramp(PIN_TB6560_STEP, PIN_TB6560_DIR, target_steps_1, true, "E1"); 
+    g_moving_e1 = false; 
+    xEventGroupSetBits(robot_event_group, BIT_EJE1_DONE); vTaskDelete(NULL); 
+}
+static void w_e2(void *arg) { 
+    g_moving_e2 = true; 
+    move_with_ramp(PIN_STEP_2, PIN_DIR_2, target_steps_2, true, "E2"); 
+    g_moving_e2 = false; 
+    xEventGroupSetBits(robot_event_group, BIT_EJE2_DONE); vTaskDelete(NULL); 
+}
+static void w_e3(void *arg) { 
+    move_with_ramp(PIN_STEP_3, PIN_DIR_3, target_steps_3, false, "E3"); 
+    xEventGroupSetBits(robot_event_group, BIT_EJE3_DONE); vTaskDelete(NULL); 
+}
 
 static void ptp_sequence_task(void *arg) {
     if (is_busy) { vTaskDelete(NULL); return; }
@@ -437,6 +481,65 @@ static void handle_jog(int cmd, int arg1) {
 }
 
 /* ============================================================
+ * TAREA DE SEGURIDAD (CORREGIDA PARA POCOS IMANES)
+ * ============================================================ */
+static void safety_monitor_task(void *arg) {
+    uint32_t last_c1 = 0;
+    uint32_t last_c2 = 0;
+    
+    // Contadores de tiempo "sin cambios"
+    uint32_t stall_ms_1 = 0;
+    uint32_t stall_ms_2 = 0;
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    last_c1 = g_pulse_count_e1;
+    last_c2 = g_pulse_count_e2;
+
+    while(1) {
+        // --- EJE 1 ---
+        if (g_moving_e1) {
+            uint32_t curr_c1 = g_pulse_count_e1;
+            if (curr_c1 == last_c1) {
+                stall_ms_1 += 100; // Sumamos 100ms al tiempo de atasco
+                if (stall_ms_1 > MAX_STALL_TIME_MS) {
+                    ESP_LOGE(TAG, "ALARMA! EJE 1 ATASCADO (TIMEOUT)");
+                    g_alarm_triggered = true;
+                    eje1_pwm_stop();
+                }
+            } else {
+                stall_ms_1 = 0; // Se movió, reseteamos contador
+                last_c1 = curr_c1;
+            }
+        } else {
+            stall_ms_1 = 0;
+            last_c1 = g_pulse_count_e1;
+        }
+
+        // --- EJE 2 (El de 4 imanes) ---
+        if (g_moving_e2) {
+            uint32_t curr_c2 = g_pulse_count_e2;
+            if (curr_c2 == last_c2) {
+                stall_ms_2 += 100; // Sumamos tiempo
+                if (stall_ms_2 > MAX_STALL_TIME_MS) {
+                    ESP_LOGE(TAG, "ALARMA! EJE 2 ATASCADO (TIMEOUT)");
+                    g_alarm_triggered = true;
+                    eje2_pwm_stop();
+                }
+            } else {
+                stall_ms_2 = 0; // Se movió, reseteamos
+                last_c2 = curr_c2;
+            }
+        } else {
+            stall_ms_2 = 0;
+            last_c2 = g_pulse_count_e2;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100)); // Loop cada 100ms
+    }
+}
+
+/* ============================================================
  * SPI
  * ============================================================ */
 static void spi_slave_task(void *arg) {
@@ -448,11 +551,20 @@ static void spi_slave_task(void *arg) {
     update_ptp_delay();
 
     while (1) {
+        if (g_alarm_triggered) {
+            sprintf((char*)tx, "900");
+        } else {
+            sprintf((char*)tx, is_busy ? "500" : "501");
+        }
+
         spi_slave_transaction_t t = { .length=12*8, .tx_buffer=tx, .rx_buffer=rx };
         spi_slave_transmit(SPI_HOST_ID, &t, portMAX_DELAY);
         int32_t cmd=0, arg1=0, arg2=0; memcpy(&cmd, rx, 4); memcpy(&arg1, rx+4, 4); memcpy(&arg2, rx+8, 4);
-        sprintf((char*)tx, is_busy ? "500" : "501");
         
+        if (g_alarm_triggered) {
+             continue; 
+        }
+
         if (is_busy && (cmd == 500 || (cmd >= 400 && cmd <= 401))) continue; 
 
         if (cmd == 700) { GLOBAL_SPEED_HZ = (float)arg1; update_ptp_delay(); }
@@ -473,9 +585,24 @@ static void init_gpio_all_ptp_safe(void) {
     reconfigure_step_to_ledc(PIN_TB6560_STEP, LEDC_CH_1, LEDC_TIMER_0, LEDC_MODE_1, LEDC_RES_1, 1000.0f);
     eje1_pwm_stop();
     reconfigure_step_to_gpio(PIN_TB6560_STEP);
+
+    // --- ENCODERS (Inputs con interrupción) ---
+    gpio_config_t enc_conf = {
+        .pin_bit_mask = (1ULL << PIN_HALL_ENC_E1) | (1ULL << PIN_HALL_ENC_E2),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = 1,
+        .intr_type = GPIO_INTR_ANYEDGE 
+    };
+    gpio_config(&enc_conf);
+    
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(PIN_HALL_ENC_E1, isr_enc_e1, NULL);
+    gpio_isr_handler_add(PIN_HALL_ENC_E2, isr_enc_e2, NULL);
 }
 
 void app_main(void) {
     init_gpio_all_ptp_safe();
+    
+    xTaskCreate(safety_monitor_task, "safe_mon", 2048, NULL, 6, NULL); 
     xTaskCreatePinnedToCore(spi_slave_task, "spi", 4096, NULL, 5, NULL, 1);
 }
