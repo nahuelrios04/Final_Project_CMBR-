@@ -12,7 +12,7 @@
 #include "esp_rom_sys.h"
 #include "driver/spi_slave.h"
 
-static const char *TAG = "ROBOT_V9_1_FINAL";
+static const char *TAG = "ROBOT_FINAL_V10_SOFT_RESET";
 
 /* ============================================================
  * --- CONFIGURACIÓN DE SEGURIDAD (HALL ENCODERS) ---
@@ -20,8 +20,8 @@ static const char *TAG = "ROBOT_V9_1_FINAL";
 #define PIN_HALL_ENC_E1  16
 #define PIN_HALL_ENC_E2  17
 
-// TIEMPO MÁXIMO PERMITIDO SIN PULSOS (ms)
-// Como en Eje 2 un pulso tarda ~1s a baja velocidad, damos 2.5s de margen.
+// TIEMPO MÁXIMO (ms) sin pulsos antes de disparar alarma
+// 2500ms es suficiente para cubrir arranque y baja velocidad con pocos imanes
 #define MAX_STALL_TIME_MS  2500 
 
 static volatile bool g_alarm_triggered = false; 
@@ -31,12 +31,12 @@ static volatile bool g_moving_e2 = false;
 static volatile uint32_t g_pulse_count_e1 = 0;
 static volatile uint32_t g_pulse_count_e2 = 0;
 
-// ISR para contar pulsos
+// ISR rápidas para contar pulsos en segundo plano
 static void IRAM_ATTR isr_enc_e1(void* arg) { g_pulse_count_e1++; }
 static void IRAM_ATTR isr_enc_e2(void* arg) { g_pulse_count_e2++; }
 
 /* ============================================================
- * CONFIGURACIÓN GLOBAL ORIGINAL
+ * CONFIGURACIÓN GLOBAL
  * ============================================================ */
 #define BIT_EJE1_DONE  (1 << 0)
 #define BIT_EJE2_DONE  (1 << 1)
@@ -57,7 +57,7 @@ static volatile int32_t target_steps_1 = 0;
 static volatile int32_t target_steps_2 = 0; 
 static volatile int32_t target_steps_3 = 0; 
 
-// VELOCIDAD DINÁMICA
+// VELOCIDAD
 static volatile float GLOBAL_SPEED_HZ = 1000.0f; 
 static volatile uint32_t GLOBAL_PTP_DELAY_US = 500; 
 
@@ -66,7 +66,6 @@ static volatile uint32_t GLOBAL_PTP_DELAY_US = 500;
 #define DELAY_PTP_MIN_US        400
 
 // --- CONSTANTES HOMING ---
-// Eje 1
 #define FREQ_MIN_HZ_H1        400.0f
 #define FREQ_PASS1_HZ_H1      900.0f
 #define FREQ_PASS2_HZ_H1      450.0f
@@ -80,7 +79,6 @@ static volatile uint32_t GLOBAL_PTP_DELAY_US = 500;
 #define MICROSTEP_1           8U
 #define HALF_TURN_STEPS_1     ((MOTOR_STEPS_PER_REV_1 * MICROSTEP_1) / 2U)
 
-// Ejes 2 y 3 (Usando sufijo _23 para ambos)
 #define FREQ_BUSQUEDA_HZ_23     1000.0f
 #define FREQ_VERIFICACION_HZ_23 400.0f
 #define TIEMPO_RAMPA_MS_23      120U
@@ -133,7 +131,7 @@ static volatile uint32_t GLOBAL_PTP_DELAY_US = 500;
 
 
 /* ============================================================
- * HELPERS BASE
+ * HELPERS
  * ============================================================ */
 static inline void update_ptp_delay() {
     if (GLOBAL_SPEED_HZ < 100.0f) GLOBAL_SPEED_HZ = 100.0f;
@@ -157,7 +155,7 @@ static inline void step_once(int pin, uint32_t delay) {
     gpio_set_level(pin, 0); esp_rom_delay_us(delay);
 }
 
-// LEDC Helpers
+// LEDC Helpers (Activamos flags de movimiento para monitoreo)
 static inline void ledc_set_duty_on(ledc_mode_t mode, ledc_channel_t ch, ledc_timer_bit_t res) {
     uint32_t duty_on = (1 << (res - 1));
     ledc_set_duty(mode, ch, duty_on); 
@@ -221,8 +219,6 @@ static void eje3_ramp_freq(float fi, float ff, uint32_t ms) {
 // Reconfiguraciones
 static void reconfigure_step_to_ledc(int pin_step, ledc_channel_t channel, ledc_timer_t timer, ledc_mode_t mode, ledc_timer_bit_t res, float freq_hz) {
     gpio_set_direction(pin_step, GPIO_MODE_OUTPUT);
-    
-    // IMPORTANTE: Aseguramos flags a false al reconfigurar
     if(channel == LEDC_CH_1) g_moving_e1 = false;
     if(channel == LEDC_CH_2) g_moving_e2 = false;
 
@@ -241,9 +237,8 @@ static void reconfigure_step_to_gpio(int pin_step) {
     gpio_set_direction(pin_step, GPIO_MODE_OUTPUT); gpio_set_level(pin_step, 0); 
 }
 
-
 /* ============================================================
- * HOMING EJE 1
+ * LOGICA HOMING
  * ============================================================ */
 static void eje1_pass1_seek_cw(void) {
     if (check_sensor(PIN_HALL_1)) {
@@ -256,7 +251,6 @@ static void eje1_pass1_seek_cw(void) {
     eje1_ramp_freq(FREQ_MIN_HZ_H1, FREQ_PASS1_HZ_H1, RAMP_MS_1);
     eje_wait_hall_active(PIN_HALL_1); eje1_pwm_stop();
     vTaskDelay(pdMS_TO_TICKS(10));
-    
     eje1_set_dir(true); eje1_set_freq(FREQ_ALIGN_HZ_1); eje1_pwm_start();
     vTaskDelay(pdMS_TO_TICKS(OVERTRAVEL_MS_1)); eje1_pwm_stop();
 }
@@ -273,7 +267,6 @@ static void eje1_pass2_return_align_ccw(void) {
     uint32_t t1 = (uint32_t)esp_log_timestamp();
     while(!check_sensor(PIN_HALL_1) && (esp_log_timestamp()-t1)<4000) vTaskDelay(pdMS_TO_TICKS(2));
     eje1_pwm_stop();
-    
     eje1_set_dir(false); eje1_set_freq(FREQ_ALIGN_HZ_1); eje1_pwm_start();
     if(!check_sensor(PIN_HALL_1)) eje_wait_hall_active(PIN_HALL_1);
     vTaskDelay(pdMS_TO_TICKS(20)); eje1_pwm_stop();
@@ -292,12 +285,8 @@ static void homing_eje1_logic(void) {
     ESP_LOGI(TAG, "Homing E1 OK");
 }
 
-/* ============================================================
- * HOMING EJE 2/3
- * ============================================================ */
 typedef enum { SOBREPASO_OK=0, SOBREPASO_ENDSTOP=1 } sobrepaso_res_t;
 
-// --- EJE 2 ---
 static sobrepaso_res_t eje2_verificar_sobrepaso(void) {
     eje2_set_freq(FREQ_VERIFICACION_HZ_23); eje2_pwm_start();
     if(check_sensor(PIN_HALL_2)) eje2_wait_hall_high();
@@ -346,7 +335,6 @@ static void homing_eje2_logic(void) {
     ESP_LOGI(TAG, "Homing E2 OK");
 }
 
-// --- EJE 3 ---
 static sobrepaso_res_t eje3_verificar_sobrepaso(void) {
     eje3_set_freq(FREQ_VERIFICACION_HZ_23); eje3_pwm_start(); 
     if(check_sensor(PIN_HALL_3)) eje3_wait_hall_high();
@@ -409,7 +397,7 @@ static void homing_sequence_task(void *arg) {
 }
 
 /* ============================================================
- * PTP
+ * PTP (MOVIMIENTO)
  * ============================================================ */
 static void move_with_ramp(int pin_step, int pin_dir, int steps, bool dir_high_cw, const char* eje_name) {
     if (steps == 0) return;
@@ -458,9 +446,12 @@ static void ptp_sequence_task(void *arg) {
     if (!robot_event_group) { robot_event_group = xEventGroupCreate(); }
     xEventGroupClearBits(robot_event_group, ALL_AXES_DONE);
     reconfigure_step_to_gpio(PIN_TB6560_STEP); reconfigure_step_to_gpio(PIN_STEP_2); reconfigure_step_to_gpio(PIN_STEP_3);
-    xTaskCreatePinnedToCore(w_e1, "P1", 4096, NULL, 10, NULL, 0);
-    xTaskCreatePinnedToCore(w_e2, "P2", 4096, NULL, 10, NULL, 1);
-    xTaskCreatePinnedToCore(w_e3, "P3", 4096, NULL, 10, NULL, 0);
+    
+    // PRIORIDAD 5 (BAJA) PARA NO BLOQUEAR SPI NI MONITOR
+    xTaskCreatePinnedToCore(w_e1, "P1", 4096, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(w_e2, "P2", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(w_e3, "P3", 4096, NULL, 5, NULL, 0);
+    
     xEventGroupWaitBits(robot_event_group, ALL_AXES_DONE, pdTRUE, pdTRUE, portMAX_DELAY);
     is_busy = false;
     vTaskDelete(NULL);
@@ -481,13 +472,11 @@ static void handle_jog(int cmd, int arg1) {
 }
 
 /* ============================================================
- * TAREA DE SEGURIDAD (CORREGIDA PARA POCOS IMANES)
+ * TAREA DE SEGURIDAD (ALTA PRIORIDAD)
  * ============================================================ */
 static void safety_monitor_task(void *arg) {
     uint32_t last_c1 = 0;
     uint32_t last_c2 = 0;
-    
-    // Contadores de tiempo "sin cambios"
     uint32_t stall_ms_1 = 0;
     uint32_t stall_ms_2 = 0;
 
@@ -501,14 +490,14 @@ static void safety_monitor_task(void *arg) {
         if (g_moving_e1) {
             uint32_t curr_c1 = g_pulse_count_e1;
             if (curr_c1 == last_c1) {
-                stall_ms_1 += 100; // Sumamos 100ms al tiempo de atasco
+                stall_ms_1 += 100;
                 if (stall_ms_1 > MAX_STALL_TIME_MS) {
-                    ESP_LOGE(TAG, "ALARMA! EJE 1 ATASCADO (TIMEOUT)");
+                    ESP_LOGE(TAG, "ALARMA! EJE 1 ATASCADO");
                     g_alarm_triggered = true;
                     eje1_pwm_stop();
                 }
             } else {
-                stall_ms_1 = 0; // Se movió, reseteamos contador
+                stall_ms_1 = 0;
                 last_c1 = curr_c1;
             }
         } else {
@@ -516,18 +505,18 @@ static void safety_monitor_task(void *arg) {
             last_c1 = g_pulse_count_e1;
         }
 
-        // --- EJE 2 (El de 4 imanes) ---
+        // --- EJE 2 ---
         if (g_moving_e2) {
             uint32_t curr_c2 = g_pulse_count_e2;
             if (curr_c2 == last_c2) {
-                stall_ms_2 += 100; // Sumamos tiempo
+                stall_ms_2 += 100;
                 if (stall_ms_2 > MAX_STALL_TIME_MS) {
-                    ESP_LOGE(TAG, "ALARMA! EJE 2 ATASCADO (TIMEOUT)");
+                    ESP_LOGE(TAG, "ALARMA! EJE 2 ATASCADO");
                     g_alarm_triggered = true;
                     eje2_pwm_stop();
                 }
             } else {
-                stall_ms_2 = 0; // Se movió, reseteamos
+                stall_ms_2 = 0;
                 last_c2 = curr_c2;
             }
         } else {
@@ -535,12 +524,12 @@ static void safety_monitor_task(void *arg) {
             last_c2 = g_pulse_count_e2;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100)); // Loop cada 100ms
+        vTaskDelay(pdMS_TO_TICKS(100)); 
     }
 }
 
 /* ============================================================
- * SPI
+ * SPI (ALTA PRIORIDAD + COMANDO 999 RESET)
  * ============================================================ */
 static void spi_slave_task(void *arg) {
     spi_bus_config_t buscfg = { .mosi_io_num=PIN_SPI_MOSI, .miso_io_num=PIN_SPI_MISO, .sclk_io_num=PIN_SPI_SCK, .quadwp_io_num=-1, .quadhd_io_num=-1, .max_transfer_sz=32 };
@@ -551,6 +540,7 @@ static void spi_slave_task(void *arg) {
     update_ptp_delay();
 
     while (1) {
+        // Reportamos Alarma 900 si está activa
         if (g_alarm_triggered) {
             sprintf((char*)tx, "900");
         } else {
@@ -561,6 +551,21 @@ static void spi_slave_task(void *arg) {
         spi_slave_transmit(SPI_HOST_ID, &t, portMAX_DELAY);
         int32_t cmd=0, arg1=0, arg2=0; memcpy(&cmd, rx, 4); memcpy(&arg1, rx+4, 4); memcpy(&arg2, rx+8, 4);
         
+        // --- SOFT RESET DE ALARMA (999) ---
+        if (cmd == 999) {
+            if (g_alarm_triggered) {
+                ESP_LOGW(TAG, "!!! ALARMA RESETEADA POR SOFTWARE !!!");
+                g_alarm_triggered = false;
+                is_busy = false;
+                // Forzamos parada
+                eje1_pwm_stop();
+                eje2_pwm_stop();
+                eje3_pwm_stop();
+            }
+            continue;
+        }
+        // ----------------------------------
+
         if (g_alarm_triggered) {
              continue; 
         }
@@ -586,7 +591,7 @@ static void init_gpio_all_ptp_safe(void) {
     eje1_pwm_stop();
     reconfigure_step_to_gpio(PIN_TB6560_STEP);
 
-    // --- ENCODERS (Inputs con interrupción) ---
+    // --- ENCODERS ---
     gpio_config_t enc_conf = {
         .pin_bit_mask = (1ULL << PIN_HALL_ENC_E1) | (1ULL << PIN_HALL_ENC_E2),
         .mode = GPIO_MODE_INPUT,
@@ -603,6 +608,9 @@ static void init_gpio_all_ptp_safe(void) {
 void app_main(void) {
     init_gpio_all_ptp_safe();
     
-    xTaskCreate(safety_monitor_task, "safe_mon", 2048, NULL, 6, NULL); 
-    xTaskCreatePinnedToCore(spi_slave_task, "spi", 4096, NULL, 5, NULL, 1);
+    // PRIORIDAD 20: Monitor de Seguridad (Máxima, para que nunca deje de chequear)
+    xTaskCreate(safety_monitor_task, "safe_mon", 2048, NULL, 20, NULL); 
+    
+    // PRIORIDAD 15: SPI (Alta, para que nunca deje de responder)
+    xTaskCreatePinnedToCore(spi_slave_task, "spi", 4096, NULL, 15, NULL, 1);
 }
